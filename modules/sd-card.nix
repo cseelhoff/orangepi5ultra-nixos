@@ -25,9 +25,10 @@ in
     };
   };
 
+  image.baseName = "opi5ultra-nixos";
+
   sdImage = {
     inherit rootPartitionUUID;
-    imageBaseName = "opi5ultra-nixos";
     compressImage = true;
     populateFirmwareCommands = ''
       ${config.boot.loader.generic-extlinux-compatible.populateCmd} -c ${config.system.build.toplevel} -d ./firmware

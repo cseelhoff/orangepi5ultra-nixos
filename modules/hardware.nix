@@ -24,4 +24,14 @@
 
   boot.kernelPackages = lib.mkForce (pkgsKernel.linuxPackagesFor kernel);
   hardware.deviceTree.name = lib.mkForce "rockchip/rk3588-orangepi-5-ultra.dtb";
+
+  # The AP6611S's bcmdhd driver scans unreliably with MAC address
+  # randomization and power saving on: `nmcli device wifi list` can come back
+  # empty even with APs in range and connected to from another OS. Disabling
+  # both (no effect unless networking.networkmanager.enable = true) fixed it.
+  networking.networkmanager.wifi = {
+    scanRandMacAddress = false;
+    macAddress = "permanent";
+    powersave = false;
+  };
 }
