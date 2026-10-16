@@ -16,6 +16,12 @@
 
   nixpkgs.hostPlatform = lib.mkDefault "aarch64-linux";
 
+  # The kernel is not on cache.nixos.org; fetch it from this flake's Cachix.
+  nix.settings = {
+    substituters = [ "https://cseelhoff-opi5ultra.cachix.org" ];
+    trusted-public-keys = [ "cseelhoff-opi5ultra.cachix.org-1:5YubECsqm2rE4P70yAwKxuCGAZ+EHyb9Ql227z4xlWE=" ];
+  };
+
   boot.kernelPackages = lib.mkForce (pkgsKernel.linuxPackagesFor kernel);
   hardware.deviceTree.name = lib.mkForce "rockchip/rk3588-orangepi-5-ultra.dtb";
 }

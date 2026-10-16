@@ -93,13 +93,22 @@ cd ~/nixos-config && sudo nixos-rebuild switch --flake '.#opi5ultra'
 
 ## Binary cache (Cachix)
 
-One-time setup:
+Public cache: `https://cseelhoff-opi5ultra.cachix.org`, key
+`cseelhoff-opi5ultra.cachix.org-1:5YubECsqm2rE4P70yAwKxuCGAZ+EHyb9Ql227z4xlWE=`.
 
-1. Create a public cache named `cseelhoff-opi5ultra` at <https://app.cachix.org>.
-2. Uncomment `nixConfig` in `flake.nix` and the two `nix.settings` lines in
-   `image/configuration.nix`, filling in the cache's public key.
-3. `nix shell nixpkgs#cachix -c cachix authtoken <token>`
-4. Push the kernel: `nix build .#kernel && cachix push cseelhoff-opi5ultra ./result`
+- **NixOS hosts** importing `nixosModules.hardware` (including the image) get it
+  in `nix.settings` automatically.
+- **Other machines** building this flake: `nix build` offers the flake's
+  `nixConfig` (`--accept-flake-config`) if your user is in `trusted-users`;
+  otherwise add the substituter and key to `/etc/nix/nix.conf`.
+- **CI** pushes with the `CACHIX_AUTH_TOKEN` repository secret (a Write token
+  from the cache's Settings → Auth Tokens).
+
+Pushing by hand, after `cachix authtoken` (reads the token from stdin):
+
+```sh
+nix build .#kernel && cachix push cseelhoff-opi5ultra ./result
+```
 
 ## Known issues and notes
 

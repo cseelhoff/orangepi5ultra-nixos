@@ -16,11 +16,12 @@
     };
   };
 
-  # Prebuilt kernel. Uncomment once the Cachix cache exists (see README).
-  # nixConfig = {
-  #   extra-substituters = [ "https://cseelhoff-opi5ultra.cachix.org" ];
-  #   extra-trusted-public-keys = [ "cseelhoff-opi5ultra.cachix.org-1:REPLACE_ME" ];
-  # };
+  # Prebuilt kernel for `nix build` of this flake on any machine. (Hosts that
+  # import nixosModules.hardware get the same cache via nix.settings.)
+  nixConfig = {
+    extra-substituters = [ "https://cseelhoff-opi5ultra.cachix.org" ];
+    extra-trusted-public-keys = [ "cseelhoff-opi5ultra.cachix.org-1:5YubECsqm2rE4P70yAwKxuCGAZ+EHyb9Ql227z4xlWE=" ];
+  };
 
   outputs = { self, nixpkgs, nixpkgs-kernel, nixos-rk3588, ... }:
     let

@@ -1,6 +1,6 @@
 # Builds the kernel and image natively on GitHub's arm64 runners, pushes them
 # to Cachix, and attaches the image to a release for v* tags.
-# Needs the CACHIX_AUTH_TOKEN repository secret. Untested: expect to tune
+# Needs the CACHIX_AUTH_TOKEN repository secret (Write token). Untested: expect to tune
 # disk space (the kernel build needs several GB) on the first runs.
 name: build
 

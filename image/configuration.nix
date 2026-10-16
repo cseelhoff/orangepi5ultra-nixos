@@ -18,9 +18,6 @@
   };
 
   nix.settings.experimental-features = [ "nix-command" "flakes" ];
-  # Prebuilt kernel for the first nixos-rebuild. Uncomment with flake.nix's nixConfig.
-  # nix.settings.extra-substituters = [ "https://cseelhoff-opi5ultra.cachix.org" ];
-  # nix.settings.extra-trusted-public-keys = [ "cseelhoff-opi5ultra.cachix.org-1:REPLACE_ME" ];
 
   services.openssh = {
     enable = true;
