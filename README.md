@@ -112,8 +112,31 @@ nix build .#kernel && cachix push cseelhoff-opi5ultra ./result
 
 ## Known issues and notes
 
+> **⚠️ NVMe dropout, cause NOT confirmed — suspect the hardware first.**
+> On 2026-10-16 the NVMe vanished from the PCIe bus
+> (`controller is down; will reset: CSTS=0xffffffff`) about 5 s after an
+> all-core CPU load started, after sitting idle for an hour without issue.
+> The board had previously been **shorting against its metal Orange Pi
+> enclosure**, and the M.2 slot faces the base plate. The kernel parameters
+> in `modules/hardware.nix` (`nvme_core.default_ps_max_latency_us=0`,
+> `pcie_aspm=off`, `pcie_port_pm=off`) are only the kernel's generic
+> power-saving workaround and **cannot fix a short or a weak power supply**.
+> Before putting a root filesystem on the NVMe: run the board outside the
+> enclosure (or insulate the base plate), use a known-good 5 V / 5 A USB-C
+> supply, and repeat `stress-ng --cpu 8` with I/O on the NVMe for 30+ minutes.
+
 - **Wi-Fi:** nixos-rk3588's kernel config builds `bcmdhd` for PCIe (5 Plus);
   `kernel.nix` switches it to SDIO for the Ultra's AP6611S.
+- **Wi-Fi scanning:** with NetworkManager's MAC randomization or power saving
+  on, the AP6611S found no networks; both are disabled in `modules/hardware.nix`.
+- **GPU:** this kernel binds the Mali-G610 to ARM's vendor `mali` (kbase)
+  driver. nixpkgs' Mesa cannot use it, so there is **no GPU acceleration**
+  yet (glmark2 fails, vulkaninfo finds no driver). Options: switch to the
+  open `panthor` driver (compiled in, needs DT + firmware work) or package a
+  kbase userspace (mesa-panfork / libmali).
+- **Video codecs / NPU:** `/dev/mpp_service`, `/dev/rga` and the RKNPU driver
+  exist, but nixpkgs has no Rockchip MPP, RGA, ffmpeg-rkmpp or RKNN packages.
+- **HDMI input** (`rk_hdmirx`, `/dev/video0`) works with plain `v4l2-ctl`.
 - **Kernel command line** has both `root=UUID=…` and `root=fstab` (from
   upstream modules with the systemd initrd); both resolve to the same partition.
 - The image's 32 MiB gap before `BOOT` leaves room to embed U-Boot later

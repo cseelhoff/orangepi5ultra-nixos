@@ -1,0 +1,178 @@
+
+==================== System ====================
+Fri Oct 16 06:29:27 PM CDT 2026
+Linux opi5ultra 6.1.115 #1-NixOS SMP @315532800 aarch64 GNU/Linux
+PRETTY_NAME="NixOS 26.05 (Yarara)"
+RK3588 OPi 5 Ultra
+8
+               total        used        free      shared  buff/cache   available
+Mem:            15Gi       1.4Gi       4.8Gi        39Mi       9.5Gi        14Gi
+policy0: ondemand 1800 MHz max
+policy4: ondemand 2352 MHz max
+policy6: ondemand 2352 MHz max
+temps: soc-thermal=44C bigcore0-thermal=44C bigcore1-thermal=44C littlecore-thermal=44C center-thermal=44C gpu-thermal=43C npu-thermal=43C 
+
+==================== Device nodes and drivers ====================
+crw-rw-rw-  1 root root   10, 119 Oct 16 17:26 /dev/mali0
+crw-------  1 root root  241,   0 Oct 16 17:26 /dev/mpp_service
+crw-------  1 root root   10, 122 Oct 16 17:26 /dev/rga
+crw-rw----+ 1 root video  81,   0 Oct 16 17:26 /dev/video0
+
+/dev/dri/:
+total 0
+drwxr-xr-x  2 root root        120 Oct 16 17:26 by-path
+crw-rw----+ 1 root video  226,   0 Oct 16 17:26 card0
+crw-rw----+ 1 root video  226,   1 Oct 16 17:26 card1
+crw-rw-rw-  1 root render 226, 128 Oct 16 17:26 renderD128
+crw-rw-rw-  1 root render 226, 129 Oct 16 17:26 renderD129
+card0 -> rockchip-drm
+card1 -> RKNPU
+panfrost               69632  0
+[   24.920804] mali fb000000.gpu: Kernel DDK version g25p0-00eac0
+
+==================== GPU: EGL / GLES / Vulkan driver in use ====================
+ERROR: [Loader Message] Code 0 : vkCreateInstance: Found no drivers!
+ERROR at /build/source/vulkaninfo/./vulkaninfo.h:611:vkCreateInstance failed with ERROR_INCOMPATIBLE_DRIVER
+
+==================== GPU: glmark2 ====================
+Error: Failed to create GBM device
+Error: main: Could not initialize canvas
+[exit 1]
+Error: main: Could not initialize canvas
+[exit 1]
+Error: main: Could not initialize canvas
+[exit 1]
+Error: main: Could not initialize canvas
+[exit 1]
+
+==================== CPU (stress-ng, 30 s each) ====================
+temps before: soc-thermal=44C bigcore0-thermal=43C bigcore1-thermal=43C littlecore-thermal=44C center-thermal=43C gpu-thermal=43C npu-thermal=43C 
+$ stress-ng --cpu 1 --cpu-method matrixprod -t 30s --metrics-brief
+stress-ng: info:  [23513] setting to a 30 secs run per stressor
+stress-ng: info:  [23513] dispatching hogs: 1 cpu
+stress-ng: info:  [23513] stopping 1 stressors
+stress-ng: metrc: [23513] stressor       bogo ops real time  usr time  sys time   bogo ops/s     bogo ops/s
+stress-ng: metrc: [23513]                           (secs)    (secs)    (secs)   (real time) (usr+sys time)
+stress-ng: metrc: [23513] cpu                1181     25.58     25.53      0.01        46.17          46.24
+stress-ng: info:  [23513] skipped: 0
+stress-ng: info:  [23513] passed: 1: cpu (1)
+stress-ng: info:  [23513] failed: 0
+stress-ng: info:  [23513] metrics untrustworthy: 0
+stress-ng: info:  [23513] successful run completed in 27.01 secs
+[exit 124]
+$ stress-ng --cpu 8 --cpu-method matrixprod -t 30s --metrics-brief
+stress-ng: info:  [23547] setting to a 30 secs run per stressor
+stress-ng: info:  [23547] dispatching hogs: 8 cpu
+stress-ng: info:  [23547] note: system has only 184 MB of free memory and swap, recommend using --oom-avoid
+stress-ng: metrc: [23547] stressor       bogo ops real time  usr time  sys time   bogo ops/s     bogo ops/s
+stress-ng: metrc: [23547]                           (secs)    (secs)    (secs)   (real time) (usr+sys time)
+stress-ng: metrc: [23547] cpu                7585     30.08    233.98      0.16       252.15          32.40
+stress-ng: info:  [23547] skipped: 0
+stress-ng: info:  [23547] passed: 8: cpu (8)
+stress-ng: info:  [23547] failed: 0
+stress-ng: info:  [23547] metrics untrustworthy: 0
+stress-ng: info:  [23547] successful run completed in 30.14 secs
+[exit 0]
+$ stress-ng --memcpy 4 -t 20s --metrics-brief
+stress-ng: info:  [23565] setting to a 20 secs run per stressor
+stress-ng: info:  [23565] dispatching hogs: 4 memcpy
+stress-ng: info:  [23565] note: system has only 98 MB of free memory and swap, recommend using --oom-avoid
+stress-ng: metrc: [23565] stressor       bogo ops real time  usr time  sys time   bogo ops/s     bogo ops/s
+stress-ng: metrc: [23565]                           (secs)    (secs)    (secs)   (real time) (usr+sys time)
+stress-ng: metrc: [23565] memcpy             9585     20.01     71.58      0.02       478.97         133.88
+stress-ng: info:  [23565] skipped: 0
+stress-ng: info:  [23565] passed: 4: memcpy (4)
+stress-ng: info:  [23565] failed: 0
+stress-ng: info:  [23565] metrics untrustworthy: 0
+stress-ng: info:  [23565] successful run completed in 20.02 secs
+[exit 0]
+temps after: soc-thermal=58C bigcore0-thermal=59C bigcore1-thermal=59C littlecore-thermal=58C center-thermal=57C gpu-thermal=56C npu-thermal=56C 
+/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq:1008000
+/sys/devices/system/cpu/cpufreq/policy4/scaling_cur_freq:1200000
+/sys/devices/system/cpu/cpufreq/policy6/scaling_cur_freq:600000
+
+==================== Storage (fio on the disk holding this directory, 512 MiB file) ====================
+/dev/mmcblk1p2   58G   25G   31G  45% /
+  read: IOPS=21, BW=21.7MiB/s (22.7MB/s)(441MiB/20368msec)
+    slat (usec): min=61, max=551011, avg=13165.62, stdev=41479.90
+  write: IOPS=5, BW=5668KiB/s (5804kB/s)(118MiB/21319msec); 0 zone resets
+    slat (usec): min=150, max=4477.2k, avg=160695.75, stdev=767182.06
+  read: IOPS=1503, BW=6015KiB/s (6160kB/s)(118MiB/20013msec)
+    slat (usec): min=4, max=592, avg=24.82, stdev=13.54
+    clat (usec): min=984, max=315456, avg=21247.71, stdev=13991.57
+     lat (usec): min=1004, max=315481, avg=21272.53, stdev=13992.92
+  write: IOPS=144, BW=580KiB/s (594kB/s)(12.4MiB/21948msec); 0 zone resets
+    slat (usec): min=7, max=862845, avg=835.63, stdev=17606.74
+
+==================== Video: test clips ====================
+ V..... h263_v4l2m2m         V4L2 mem2mem H.263 decoder wrapper (codec h263)
+ V..... h264_v4l2m2m         V4L2 mem2mem H.264 decoder wrapper (codec h264)
+ V..... hevc_v4l2m2m         V4L2 mem2mem HEVC decoder wrapper (codec hevc)
+ V..... mpeg1_v4l2m2m        V4L2 mem2mem MPEG1 decoder wrapper (codec mpeg1video)
+ V..... mpeg2_v4l2m2m        V4L2 mem2mem MPEG2 decoder wrapper (codec mpeg2video)
+ V..... mpeg4_v4l2m2m        V4L2 mem2mem MPEG4 decoder wrapper (codec mpeg4)
+ V..... vc1_v4l2m2m          V4L2 mem2mem VC1 decoder wrapper (codec vc1)
+ V..... vp8_v4l2m2m          V4L2 mem2mem VP8 decoder wrapper (codec vp8)
+ V..... vp9_v4l2m2m          V4L2 mem2mem VP9 decoder wrapper (codec vp9)
+ V..... h263_v4l2m2m         V4L2 mem2mem H.263 encoder wrapper (codec h263)
+ V..... h264_v4l2m2m         V4L2 mem2mem H.264 encoder wrapper (codec h264)
+ V..... hevc_v4l2m2m         V4L2 mem2mem HEVC encoder wrapper (codec hevc)
+ V..... mpeg4_v4l2m2m        V4L2 mem2mem MPEG4 encoder wrapper (codec mpeg4)
+ V..... vp8_v4l2m2m          V4L2 mem2mem VP8 encoder wrapper (codec vp8)
+$ ffmpeg -hide_banner -loglevel error -y -f lavfi -i testsrc2=size=1920x1080:rate=30:duration=10 -c:v libx264 -preset ultrafast -pix_fmt yuv420p /home/caleb/arch-test/work/clip-1920x1080.mp4
+[exit 0]
+$ ffmpeg -hide_banner -loglevel error -y -f lavfi -i testsrc2=size=3840x2160:rate=30:duration=10 -c:v libx264 -preset ultrafast -pix_fmt yuv420p /home/caleb/arch-test/work/clip-3840x2160.mp4
+[exit 0]
+
+==================== Video: decode speed (H.264, 300 frames) ====================
+--- 1920x1080 software
+bench: utime=2.360s stime=0.189s rtime=0.492s
+bench: maxrss=97352KiB
+--- 3840x2160 software
+bench: utime=9.957s stime=0.501s rtime=1.627s
+bench: maxrss=285564KiB
+
+==================== Video: encode speed (1080p H.264, 300 frames) ====================
+bench: utime=24.799s stime=0.535s rtime=5.692s
+bench: maxrss=437912KiB
+
+==================== HDMI capture (hdmirx) ====================
+hdmirx device: /dev/video0
+	Active width: 3840
+	Active height: 2160
+	Pixelclock: 593984000 Hz (60.00 frames per second)
+$ v4l2-ctl -d /dev/video0 --get-fmt-video
+Format Video Capture Multiplanar:
+	Width/Height      : 3840/2160
+	Pixel Format      : 'NV12' (Y/UV 4:2:0)
+	Field             : None
+	Number of planes  : 1
+	Flags             : 0x00000080
+	Colorspace        : Rec. 709
+	Transfer Function : Unknown (0x00000020)
+	YCbCr/HSV Encoding: xvYCC 709
+	Quantization      : Limited Range
+	Plane 0           :
+	   Bytes per Line : 3840
+	   Size Image     : 12441600
+[exit 0]
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< 60.00 fps
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< 60.00 fps
+<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< 60.00 fps
+$ v4l2-ctl -d /dev/video0 --stream-mmap --stream-count=1 --stream-to=/home/caleb/arch-test/work/hdmi-frame.raw
+New timings found
+<
+[exit 0]
+-rw-r--r-- 1 caleb users 12441600 Oct 16 18:37 /home/caleb/arch-test/work/hdmi-frame.raw
+
+==================== Network ====================
+IN-USE  SSID         CHAN  RATE         SIGNAL  SECURITY    
+*       ubernetHS    2     130 Mbit/s   100     WPA2        
+enP3p49s0        DOWN           
+wlan0            UP             10.146.129.124/24 2607:fb91:be7:5c46:ed5c:7ca7:28:e1cf/64 2607:fb91:be7:5c46:182c:ddbc:572f:16da/64 fe80::e0e4:6fa8:560d:9694/64 
+enP3p49s0 speed: -1 Mb/s
+(set IPERF_SERVER=<LAN host running 'iperf3 -s'> to test throughput)
+
+==================== Done ====================
+temps: soc-thermal=46C bigcore0-thermal=45C bigcore1-thermal=46C littlecore-thermal=46C center-thermal=46C gpu-thermal=45C npu-thermal=46C 
+results: /home/caleb/arch-test/results-nixos-20261016-1829.txt
