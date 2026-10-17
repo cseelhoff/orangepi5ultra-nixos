@@ -45,6 +45,13 @@ power-saving workaround (`nvme_core.default_ps_max_latency_us=0 pcie_aspm=off
 pcie_port_pm=off`) was added to the NixOS board module **as an unconfirmed
 precaution only**. It cannot fix a short or a weak power supply.
 
+**Update 2026-10-16 21:06, after adding rubber stoppers under the case:**
+same NixOS boot, still *without* the kernel workaround, 10 min of
+`stress-ng --cpu 8` + `fio --readonly` random reads on the raw NVMe:
+**no NVMe/PCIe errors**, drive present throughout, max 73 °C. Before the
+stoppers it dropped 5 s into the same load. Strong evidence for the case
+short; confirm with the write test below on Arch.
+
 This must be settled before NixOS (or anything) relies on the NVMe as root.
 Here, the NVMe is the root disk, so a dropout would crash Arch: **save work
 and keep the stress test short at first.** Suggested test (ask Caleb first):
