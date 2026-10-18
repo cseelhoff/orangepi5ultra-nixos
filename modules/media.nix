@@ -16,6 +16,10 @@ in
     KERNEL=="mpp_service", MODE="0660", GROUP="video"
     KERNEL=="rga", MODE="0660", GROUP="video"
     SUBSYSTEM=="dma_heap", MODE="0660", GROUP="video"
+    # HDMI-in audio: the receiver starts its I2S output ~50 ms after capture
+    # starts, exactly the I2S read timeout in Rockchip's DT, so every capture
+    # failed with EIO. Give it 500 ms.
+    SUBSYSTEM=="sound", KERNEL=="controlC*", ATTRS{id}=="rockchiphdmiin", RUN+="${pkgs.alsa-utils}/bin/amixer -q -c %n cset iface=PCM,name='PCM Read Wait Time MS' 500"
   '';
 
   # hdmi-passthru switches HDMI-in to low-latency hand-out (each frame given out

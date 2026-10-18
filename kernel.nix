@@ -20,10 +20,20 @@ let
     '';
     # Armbian's 78c67d98f221 drops capture from every hdmi-codec user to fix
     # HDMI-out mono audio; that also removed the HDMI receiver's only stream.
-    kernelPatches = (args.kernelPatches or [ ]) ++ [{
-      name = "hdmi-codec-keep-capture-for-hdmirx";
-      patch = ./patches/hdmi-codec-keep-capture-for-hdmirx.patch;
-    }];
+    kernelPatches = (args.kernelPatches or [ ]) ++ [
+      {
+        name = "hdmi-codec-keep-capture-for-hdmirx";
+        patch = ./patches/hdmi-codec-keep-capture-for-hdmirx.patch;
+      }
+      # HDMI-RX without the vendor BL31 (its interrupt never arrives): poll for
+      # source mode changes, start the audio worker on signal lock, program the
+      # audio path at capture start, keep I2S on during silence. (Capture also
+      # needs a longer I2S read timeout: udev rule in modules/media.nix.)
+      {
+        name = "hdmirx-without-vendor-tfa";
+        patch = ./patches/hdmirx-without-vendor-tfa.patch;
+      }
+    ];
     config = (removeAttrs args.config [ "CONFIG_BCMDHD_PCIE" ]) // {
       CONFIG_BCMDHD_SDIO = "y";
     };

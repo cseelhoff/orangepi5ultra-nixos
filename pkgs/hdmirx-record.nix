@@ -1,6 +1,7 @@
 # hdmirx-record <h264|h265> <seconds> <out.mkv> [bitrate]
-# Records HDMI-in with the hardware encoder. The receiver's /dev/videoN changes
-# between boots, so it is looked up by name.
+# Records HDMI-in with the hardware encoder, plus the HDMI-in audio (Opus) when
+# the receiver's sound card is present. The receiver's /dev/videoN changes
+# between boots, so it is looked up by name; the sound card by its ALSA id.
 { writeShellApplication, gst_all_1, gst-rockchip, coreutils, gnugrep }:
 
 writeShellApplication {
@@ -24,11 +25,20 @@ writeShellApplication {
     [ -n "$name" ] || { echo "no HDMI-in video device found" >&2; exit 1; }
     dev=/dev/$(basename "$(dirname "$name")")
 
+    audio=()
+    if grep -qx rockchiphdmiin /proc/asound/card*/id 2>/dev/null; then
+      audio=(alsasrc "device=hw:CARD=rockchiphdmiin,DEV=0" ! "audio/x-raw,rate=48000,channels=2" !
+             queue ! audioconvert ! opusenc bitrate=192000 ! queue ! mux.)
+    else
+      echo "no HDMI-in sound card; recording video only" >&2
+    fi
+
     # -e turns the SIGINT below into an end-of-stream, so the file is finalized.
     gst-launch-1.0 -e \
+      matroskamux name=mux ! filesink location="$out" \
       v4l2src device="$dev" io-mode=dmabuf ! video/x-raw,format=NV12 ! \
-      queue ! "mpp''${codec}enc" bps="$bps" rc-mode=cbr ! "''${codec}parse" ! \
-      matroskamux ! filesink location="$out" &
+      queue ! "mpp''${codec}enc" bps="$bps" rc-mode=cbr ! "''${codec}parse" ! queue ! mux. \
+      "''${audio[@]}" &
     pid=$!
     sleep "$secs"
     kill -INT "$pid"

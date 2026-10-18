@@ -1,0 +1,137 @@
+--- a/drivers/media/platform/rockchip/hdmirx/rk_hdmirx.c	2026-10-18 14:09:01.684529781 -0500
++++ b/drivers/media/platform/rockchip/hdmirx/rk_hdmirx.c	2026-10-18 16:02:51.955370722 -0500
+@@ -3374,6 +3374,14 @@
+ 	hdmirx_interrupts_setup(hdmirx_dev, true);
+ 	extcon_set_state_sync(hdmirx_dev->extcon, EXTCON_JACK_VIDEO_IN, true);
+ 	hdmirx_audio_handle_plugged_change(hdmirx_dev, 1);
++	/*
++	 * The audio worker is normally started by the vsync-threshold
++	 * interrupt, which never arrives with upstream TF-A (the HDMI-RX
++	 * interrupt was routed through the vendor BL31). Start it here too;
++	 * a pending work item is not queued twice.
++	 */
++	schedule_delayed_work_on(hdmirx_dev->bound_cpu,
++				 &hdmirx_dev->delayed_work_audio, HZ / 2);
+ }
+ 
+ static void hdmirx_plugout(struct rk_hdmirx_dev *hdmirx_dev)
+@@ -3635,11 +3643,43 @@
+ 		      AFIFO_THR_MUTE_LOW_QST(0x8) | AFIFO_THR_MUTE_HIGH_QST(0x178));
+ }
+ 
++static void hdmirx_enable_audio_output(struct rk_hdmirx_dev *hdmirx_dev,
++				       int ch_audio, int fs_audio, int spdif);
++
++/*
++ * Program the audio path when capture starts (as the mainline driver does)
++ * instead of relying only on the audio worker, which is started from an
++ * interrupt that does not arrive with upstream TF-A.
++ */
+ static int hdmirx_audio_hw_params(struct device *dev, void *data,
+ 				  struct hdmi_codec_daifmt *daifmt,
+ 				  struct hdmi_codec_params *params)
+ {
+-	dev_dbg(dev, "%s\n", __func__);
++	struct rk_hdmirx_dev *hdmirx_dev = dev_get_drvdata(dev);
++	u32 fs = hdmirx_audio_fs(hdmirx_dev);
++	u32 ch = hdmirx_audio_ch(hdmirx_dev);
++
++	if (!fs)
++		fs = params && params->sample_rate ? params->sample_rate : 48000;
++	if (!ch)
++		ch = 2;
++
++	hdmirx_update_bits(hdmirx_dev, GLOBAL_SWENABLE, AUDIO_ENABLE, AUDIO_ENABLE);
++	hdmirx_dev->audio_state.audio_enabled = true;
++	hdmirx_audio_set_fs(hdmirx_dev, fs);
++	hdmirx_audio_set_ch(hdmirx_dev, ch);
++	hdmirx_enable_audio_output(hdmirx_dev, ch, fs, 0);
++	hdmirx_audio_fifo_init(hdmirx_dev);
++	hdmirx_dev->audio_state.pre_state = 0;
++	schedule_delayed_work_on(hdmirx_dev->bound_cpu,
++				 &hdmirx_dev->delayed_work_audio, msecs_to_jiffies(200));
++
++	dev_dbg(dev, "audio hw_params: fs %u (stream %u) ch %u proc_cfg0 %#x proc_st1 %#x fifo_st2 %#x swen %#x\n",
++		 fs, params ? params->sample_rate : 0, ch,
++		 hdmirx_readl(hdmirx_dev, AUDIO_PROC_CONFIG0),
++		 hdmirx_readl(hdmirx_dev, AUDIO_PROC_STATUS1),
++		 hdmirx_readl(hdmirx_dev, AUDIO_FIFO_STATUS2),
++		 hdmirx_readl(hdmirx_dev, GLOBAL_SWENABLE));
+ 	return 0;
+ }
+ 
+@@ -3837,8 +3877,21 @@
+ 	}
+ 	as->pre_state = cur_state;
+ 
++	/*
++	 * The vendor code turned the I2S output off while samples are flat,
++	 * which stalls capture (EIO) whenever the source is silent. Keep the
++	 * output on and only log changes of the flag.
++	 */
+ 	sample_flat = hdmirx_readl(hdmirx_dev, AUDIO_PROC_STATUS1) & AUD_SAMPLE_FLAT;
+-	hdmirx_update_bits(hdmirx_dev, AUDIO_PROC_CONFIG0, I2S_EN, sample_flat ? 0 : I2S_EN);
++	{
++		static u32 last_flat = ~0u;
++
++		if (sample_flat != last_flat)
++			dev_info(hdmirx_dev->dev, "audio sample_flat %#x proc_cfg0 %#x fifo %#x\n",
++				 sample_flat, hdmirx_readl(hdmirx_dev, AUDIO_PROC_CONFIG0), cur_state);
++		last_flat = sample_flat;
++	}
++	hdmirx_update_bits(hdmirx_dev, AUDIO_PROC_CONFIG0, I2S_EN, I2S_EN);
+ 
+ exit:
+ 	schedule_delayed_work_on(hdmirx_dev->bound_cpu,
+@@ -3883,12 +3936,51 @@
+ 	mutex_unlock(&hdmirx_dev->work_lock);
+ }
+ 
++/*
++ * Source mode changes are normally reported by the HDMI-RX interrupt, which
++ * never arrives with upstream TF-A, so the driver kept a stale format (e.g.
++ * 1024x768 while the source sent 4K60) and capture stalled. Compare the
++ * detected timing with the active one once a second and run the normal
++ * signal-change handling when they differ twice in a row.
++ */
++static void hdmirx_poll_signal_change(struct rk_hdmirx_dev *hdmirx_dev)
++{
++	static int mismatch;
++	struct v4l2_dv_timings t = {};
++	struct v4l2_bt_timings *cur = &hdmirx_dev->timings.bt;
++	bool changed;
++
++	if (!mutex_trylock(&hdmirx_dev->work_lock))
++		return;
++	if (!hdmirx_dev->get_timing || port_no_link(hdmirx_dev) ||
++	    signal_not_lock(hdmirx_dev) ||
++	    hdmirx_get_detected_timings(hdmirx_dev, &t, false)) {
++		mismatch = 0;
++		mutex_unlock(&hdmirx_dev->work_lock);
++		return;
++	}
++	changed = t.bt.width != cur->width || t.bt.height != cur->height ||
++		  t.bt.interlaced != cur->interlaced ||
++		  abs((s64)t.bt.pixelclock - (s64)cur->pixelclock) > (s64)cur->pixelclock / 100;
++	mismatch = changed ? mismatch + 1 : 0;
++	mutex_unlock(&hdmirx_dev->work_lock);
++
++	if (mismatch >= 2) {
++		mismatch = 0;
++		dev_info(hdmirx_dev->dev, "poll: source timing %ux%u@%llu differs from %ux%u@%llu, re-detecting\n",
++			 t.bt.width, t.bt.height, t.bt.pixelclock,
++			 cur->width, cur->height, cur->pixelclock);
++		process_signal_change(hdmirx_dev);
++	}
++}
++
+ static void hdmirx_delayed_work_heartbeat(struct work_struct *work)
+ {
+ 	struct delayed_work *dwork = to_delayed_work(work);
+ 	struct rk_hdmirx_dev *hdmirx_dev = container_of(dwork,
+ 			struct rk_hdmirx_dev, delayed_work_heartbeat);
+ 
++	hdmirx_poll_signal_change(hdmirx_dev);
+ 	queue_work_on(hdmirx_dev->wdt_cfg_bound_cpu,  system_highpri_wq,
+ 			&hdmirx_dev->work_wdt_config);
+ 	schedule_delayed_work_on(hdmirx_dev->bound_cpu,
