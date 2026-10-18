@@ -1,7 +1,9 @@
 # GStreamer elements for Rockchip MPP: mpph264enc, mpph265enc, mppjpegenc,
-# mppvp8enc, mppvideodec. RGA, GPU conversion, rkximage and kmssrc are off
-# (not needed for v4l2src -> encoder with NV12 input).
-{ lib, stdenv, fetchFromGitHub, meson, ninja, pkg-config, gst_all_1, rockchip-mpp }:
+# mppvp8enc, mppvideodec. RGA is used for format conversion and scaling inside
+# the mpp elements (e.g. RGB input to the encoder, scaled decoder output); NV12
+# capture -> encoder does not go through it. GPU conversion, rkximage and kmssrc
+# are off.
+{ lib, stdenv, fetchFromGitHub, meson, ninja, pkg-config, gst_all_1, rockchip-mpp, librga }:
 
 stdenv.mkDerivation {
   pname = "gst-rockchip";
@@ -19,11 +21,11 @@ stdenv.mkDerivation {
   patches = [ ./gst-rockchip-min-buffers.patch ];
 
   nativeBuildInputs = [ meson ninja pkg-config ];
-  buildInputs = [ gst_all_1.gstreamer gst_all_1.gst-plugins-base rockchip-mpp ];
+  buildInputs = [ gst_all_1.gstreamer gst_all_1.gst-plugins-base rockchip-mpp librga ];
 
   mesonFlags = [
     "-Drockchipmpp=enabled"
-    "-Drga=disabled"
+    "-Drga=enabled"
     "-Dgpu=disabled"
     "-Drkximage=disabled"
     "-Dkmssrc=disabled"

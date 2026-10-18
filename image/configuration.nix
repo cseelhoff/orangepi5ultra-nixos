@@ -1,9 +1,11 @@
 # The flashed base system: just enough to log in, get online and switch to a
 # real config (`nixos-rebuild switch --flake github:cseelhoff/nixos-config#opi5ultra`).
 # Test tools, desktop, etc. belong in that config, not here.
-{ pkgs, ... }:
+{ pkgs, lib, ... }:
 {
   networking.hostName = "opi5ultra";
+  # GPU (libmali) and NPU (librknnrt) use closed but redistributable libraries.
+  nixpkgs.config.allowUnfreePredicate = pkg: builtins.elem (lib.getName pkg) [ "libmali-valhall-g610-wayland-gbm" "rknpu2" ];
   networking.networkmanager.enable = true;
   time.timeZone = "America/Chicago";
 

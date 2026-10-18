@@ -41,8 +41,12 @@
         media = ./modules/media.nix;
         # HDMI-in EDID follows the HDMI-out monitor identity (boot + hotplug).
         hdmirx-edid = ./modules/hdmirx-edid.nix;
+        # Mali-G610 GPU through Arm's closed libmali (OpenCL, Vulkan, GLES).
+        gpu = ./modules/gpu.nix;
+        # RK3588 NPU through Rockchip's native runtime (librknnrt) + rknn_benchmark.
+        npu = ./modules/npu.nix;
         default = {
-          imports = [ self.nixosModules.hardware self.nixosModules.sd-card self.nixosModules.media self.nixosModules.hdmirx-edid ];
+          imports = [ self.nixosModules.hardware self.nixosModules.sd-card self.nixosModules.media self.nixosModules.hdmirx-edid self.nixosModules.gpu self.nixosModules.npu ];
         };
       };
 
@@ -58,7 +62,9 @@
       packages.${system} = {
         inherit kernel;
         rockchip-mpp = pkgs.callPackage ./pkgs/rockchip-mpp.nix { };
-        gst-rockchip = pkgs.callPackage ./pkgs/gst-rockchip.nix { inherit (self.packages.${system}) rockchip-mpp; };
+        librga = pkgs.callPackage ./pkgs/librga.nix { };
+        rga-bench = pkgs.callPackage ./pkgs/rga-bench.nix { inherit (self.packages.${system}) librga; };
+        gst-rockchip = pkgs.callPackage ./pkgs/gst-rockchip.nix { inherit (self.packages.${system}) rockchip-mpp librga; };
         hdmirx-record = pkgs.callPackage ./pkgs/hdmirx-record.nix { inherit (self.packages.${system}) gst-rockchip; };
         hdmirx-edid-sync = pkgs.callPackage ./pkgs/hdmirx-edid-sync.nix { };
         hdmi-passthru = pkgs.callPackage ./pkgs/hdmi-passthru.nix { };

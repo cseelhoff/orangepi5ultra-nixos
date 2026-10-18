@@ -4,7 +4,9 @@
 { pkgs, ... }:
 let
   rockchip-mpp = pkgs.callPackage ../pkgs/rockchip-mpp.nix { };
-  gst-rockchip = pkgs.callPackage ../pkgs/gst-rockchip.nix { inherit rockchip-mpp; };
+  librga = pkgs.callPackage ../pkgs/librga.nix { };
+  rga-bench = pkgs.callPackage ../pkgs/rga-bench.nix { inherit librga; };
+  gst-rockchip = pkgs.callPackage ../pkgs/gst-rockchip.nix { inherit rockchip-mpp librga; };
   hdmirx-record = pkgs.callPackage ../pkgs/hdmirx-record.nix { inherit gst-rockchip; };
   hdmi-passthru = pkgs.callPackage ../pkgs/hdmi-passthru.nix { };
 in
@@ -28,6 +30,8 @@ in
     gst-rockchip
     hdmirx-record
     hdmi-passthru # HDMI-in -> HDMI-out with a text overlay, ~1 ms
+    librga
+    rga-bench # RGA scale/convert throughput
     pkgs.gst_all_1.gstreamer
     pkgs.v4l-utils
   ];
