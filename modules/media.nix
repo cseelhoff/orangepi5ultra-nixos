@@ -6,6 +6,7 @@ let
   rockchip-mpp = pkgs.callPackage ../pkgs/rockchip-mpp.nix { };
   gst-rockchip = pkgs.callPackage ../pkgs/gst-rockchip.nix { inherit rockchip-mpp; };
   hdmirx-record = pkgs.callPackage ../pkgs/hdmirx-record.nix { inherit gst-rockchip; };
+  hdmi-passthru = pkgs.callPackage ../pkgs/hdmi-passthru.nix { };
 in
 {
   # The encoder, RGA and DMA heaps are root-only (0600) by default.
@@ -15,10 +16,18 @@ in
     SUBSYSTEM=="dma_heap", MODE="0660", GROUP="video"
   '';
 
+  # hdmi-passthru switches HDMI-in to low-latency hand-out (each frame given out
+  # at input line 10) while it runs and restores it on exit. It stays off
+  # otherwise: an encoder reading a frame that is still arriving would record tears.
+  systemd.tmpfiles.rules = [
+    "z /sys/module/rockchip_hdmirx/parameters/low_latency 0664 root video -"
+  ];
+
   environment.systemPackages = [
     rockchip-mpp # mpi_enc_test, mpi_dec_test, ...
     gst-rockchip
     hdmirx-record
+    hdmi-passthru # HDMI-in -> HDMI-out with a text overlay, ~1 ms
     pkgs.gst_all_1.gstreamer
     pkgs.v4l-utils
   ];

@@ -39,8 +39,10 @@
         sd-card = ./modules/sd-card.nix;
         # Hardware H.264/H.265 encode (MPP), GStreamer mpp* elements, hdmirx-record.
         media = ./modules/media.nix;
+        # HDMI-in EDID follows the HDMI-out monitor identity (boot + hotplug).
+        hdmirx-edid = ./modules/hdmirx-edid.nix;
         default = {
-          imports = [ self.nixosModules.hardware self.nixosModules.sd-card self.nixosModules.media ];
+          imports = [ self.nixosModules.hardware self.nixosModules.sd-card self.nixosModules.media self.nixosModules.hdmirx-edid ];
         };
       };
 
@@ -58,6 +60,8 @@
         rockchip-mpp = pkgs.callPackage ./pkgs/rockchip-mpp.nix { };
         gst-rockchip = pkgs.callPackage ./pkgs/gst-rockchip.nix { inherit (self.packages.${system}) rockchip-mpp; };
         hdmirx-record = pkgs.callPackage ./pkgs/hdmirx-record.nix { inherit (self.packages.${system}) gst-rockchip; };
+        hdmirx-edid-sync = pkgs.callPackage ./pkgs/hdmirx-edid-sync.nix { };
+        hdmi-passthru = pkgs.callPackage ./pkgs/hdmi-passthru.nix { };
         sdImage = self.nixosConfigurations.opi5ultra.config.system.build.sdImage;
         default = self.packages.${system}.sdImage;
       };
