@@ -1,0 +1,57 @@
+--- a/sound/soc/codecs/hdmi-codec.c
++++ b/sound/soc/codecs/hdmi-codec.c
+@@ -5,6 +5,7 @@
+  * Author: Jyri Sarha <jsarha@ti.com>
+  */
+ #include <linux/module.h>
++#include <linux/of.h>
+ #include <linux/string.h>
+ #include <sound/core.h>
+ #include <sound/jack.h>
+@@ -1074,6 +1075,7 @@
+ 	struct device *dev = &pdev->dev;
+ 	struct hdmi_codec_priv *hcp;
+ 	int dai_count, i = 0;
++	bool hdmi_rx;
+ 	int ret;
+ 
+ 	if (!hcd) {
+@@ -1098,6 +1100,13 @@
+ 
+ 	hcp->tx_dlp = device_property_read_bool(dev->parent, "audio,digital-loopback");
+ 
++	/*
++	 * Capture is disabled below for HDMI-TX, but the RK3588 HDMI receiver
++	 * registers this codec too and is capture-only: keep capture for it.
++	 */
++	hdmi_rx = dev->parent && of_device_is_compatible(dev->parent->of_node,
++							 "rockchip,hdmirx-ctrler");
++
+ 	ret = snd_pcm_create_iec958_consumer_default(hcp->iec_status,
+ 						     sizeof(hcp->iec_status));
+ 	if (ret < 0)
+@@ -1115,16 +1124,20 @@
+ 		 * causes "Only one simultaneous stream supported!" errors
+ 		 * and results in mono audio output.
+ 		 */
+-		daidrv[i].capture.channels_min = 0;
+-		daidrv[i].capture.channels_max = 0;
++		if (!hdmi_rx) {
++			daidrv[i].capture.channels_min = 0;
++			daidrv[i].capture.channels_max = 0;
++		}
+ 		i++;
+ 	}
+ 
+ 	if (hcd->spdif) {
+ 		daidrv[i] = hdmi_spdif_dai;
+ 		/* Disable capture for HDMI-TX SPDIF (output only) */
+-		daidrv[i].capture.channels_min = 0;
+-		daidrv[i].capture.channels_max = 0;
++		if (!hdmi_rx) {
++			daidrv[i].capture.channels_min = 0;
++			daidrv[i].capture.channels_max = 0;
++		}
+ 	}
+ 
+ 	dev_set_drvdata(dev, hcp);

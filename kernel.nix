@@ -18,6 +18,12 @@ let
           ${args.configfile} > $out
       grep -qx 'CONFIG_BCMDHD_SDIO=y' $out
     '';
+    # Armbian's 78c67d98f221 drops capture from every hdmi-codec user to fix
+    # HDMI-out mono audio; that also removed the HDMI receiver's only stream.
+    kernelPatches = (args.kernelPatches or [ ]) ++ [{
+      name = "hdmi-codec-keep-capture-for-hdmirx";
+      patch = ./patches/hdmi-codec-keep-capture-for-hdmirx.patch;
+    }];
     config = (removeAttrs args.config [ "CONFIG_BCMDHD_PCIE" ]) // {
       CONFIG_BCMDHD_SDIO = "y";
     };
