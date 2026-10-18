@@ -28,6 +28,7 @@
       system = "aarch64-linux";
       pkgsKernel = import nixpkgs-kernel { inherit system; };
       kernel = import ./kernel.nix { inherit pkgsKernel nixos-rk3588; };
+      pkgs = nixpkgs.legacyPackages.${system};
     in
     {
       nixosModules = {
@@ -36,8 +37,10 @@
         # Partition layout + extlinux boot of the image. Keep it imported after
         # flashing: it defines fileSystems and the bootloader.
         sd-card = ./modules/sd-card.nix;
+        # Hardware H.264/H.265 encode (MPP), GStreamer mpp* elements, hdmirx-record.
+        media = ./modules/media.nix;
         default = {
-          imports = [ self.nixosModules.hardware self.nixosModules.sd-card ];
+          imports = [ self.nixosModules.hardware self.nixosModules.sd-card self.nixosModules.media ];
         };
       };
 
@@ -52,6 +55,9 @@
 
       packages.${system} = {
         inherit kernel;
+        rockchip-mpp = pkgs.callPackage ./pkgs/rockchip-mpp.nix { };
+        gst-rockchip = pkgs.callPackage ./pkgs/gst-rockchip.nix { inherit (self.packages.${system}) rockchip-mpp; };
+        hdmirx-record = pkgs.callPackage ./pkgs/hdmirx-record.nix { inherit (self.packages.${system}) gst-rockchip; };
         sdImage = self.nixosConfigurations.opi5ultra.config.system.build.sdImage;
         default = self.packages.${system}.sdImage;
       };

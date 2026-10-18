@@ -1,0 +1,19 @@
+diff --git a/gst/rockchipmpp/gstmppenc.c b/gst/rockchipmpp/gstmppenc.c
+index a75125f..dfa6c03 100644
+--- a/gst/rockchipmpp/gstmppenc.c
++++ b/gst/rockchipmpp/gstmppenc.c
+@@ -789,7 +789,13 @@ gst_mpp_enc_propose_allocation (GstVideoEncoder * encoder, GstQuery * query)
+ 
+   gst_buffer_pool_set_config (pool, config);
+ 
+-  gst_query_add_allocation_pool (query, pool, size, 0, 0);
++  {
++    /* Ask upstream (e.g. v4l2src) for spare buffers so several frames can be
++     * in flight in MPP at once; otherwise each frame waits for the previous. */
++    const gchar *env = g_getenv ("GST_MPP_ENC_MIN_BUFFERS");
++    guint min_bufs = env ? (guint) atoi (env) : 4;
++    gst_query_add_allocation_pool (query, pool, size, min_bufs, 0);
++  }
+   gst_query_add_allocation_param (query, self->allocator, NULL);
+ 
+   gst_object_unref (pool);
