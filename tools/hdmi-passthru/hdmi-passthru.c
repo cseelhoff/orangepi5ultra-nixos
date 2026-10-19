@@ -10,6 +10,7 @@
 // being written ("beam racing").
 //
 // Usage: hdmi-passthru [-t text] [-s seconds] [-n buffers] [-p phase_ms] [-L] [-f] [-q] [-l log.csv] [-R]
+//                      [-S socket [-G group]]
 //   -p  hold the output vblank this long after the capture timestamp (default 1.2;
 //       negative disables the phase lock). Below ~0.7 ms frames start to miss.
 //   -L  keep normal capture (frame handed out when complete, ~16 ms more latency).
@@ -17,6 +18,9 @@
 //   -f  wait for the capture fence (frame complete) before scanout
 //   -q  quiet: no per-second stats on stderr
 //   -R  only repair a display left in a bad state (refresh range, plane order)
+//   -S  serve the Natively edge daemon on this Unix socket (see novl.h): it draws the overlay,
+//       which then covers the whole output instead of the stats box, and asks for screenshots.
+//       The socket is mode 0660, group -G. At least 6 capture buffers are used.
 #define _GNU_SOURCE
 #include <cairo.h>
 #include <errno.h>
@@ -36,6 +40,8 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
+
+#include "novl.h"
 
 #define MAXBUF 8
 #define die(...) do { fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); exit(1); } while (0)
@@ -176,6 +182,7 @@ static uint64_t pending_commit_ns;
 static uint32_t crtc_id, vplane, oplane;
 static struct dumb ov[2];
 static int ov_cur, ov_dirty;
+static struct novl *novl;	/* the edge daemon's server, with -S */
 static int wait_fence;
 
 /* phase lock: nudge the output frame length (VOP2 "variable refresh rate",
@@ -190,13 +197,25 @@ static int lat_n, dropped, total_shown, total_dropped;
 static double all_lat[100000];
 static int all_n;
 
-static void qbuf(int i)
+static int qbuf_try(int i)
 {
 	struct v4l2_plane pl[VIDEO_MAX_PLANES] = { 0 };
 	struct v4l2_buffer b = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, .memory = V4L2_MEMORY_MMAP,
 				 .index = i, .m.planes = pl, .length = 1 };
-	if (xioctl(vfd, VIDIOC_QBUF, &b))
+	return xioctl(vfd, VIDIOC_QBUF, &b);
+}
+
+static void qbuf(int i)
+{
+	if (qbuf_try(i))
 		die("QBUF: %s", strerror(errno));
+}
+
+/* a capture buffer a snapshot was reading; called from the novl thread, which must not exit() */
+static void novl_requeue(void *ctx, int i)
+{
+	(void)ctx;
+	qbuf_try(i);
 }
 
 static void commit(int i)
@@ -205,7 +224,11 @@ static void commit(int i)
 	add(req, dfd, vplane, DRM_MODE_OBJECT_PLANE, "FB_ID", bufs[i].fb);
 	if (wait_fence && bufs[i].fence >= 0)
 		add(req, dfd, vplane, DRM_MODE_OBJECT_PLANE, "IN_FENCE_FD", bufs[i].fence);
-	if (ov_dirty) {
+	if (novl) {
+		int o = novl_overlay_next(novl);
+		if (o >= 0)
+			add(req, dfd, oplane, DRM_MODE_OBJECT_PLANE, "FB_ID", ov[o].fb);
+	} else if (ov_dirty) {
 		add(req, dfd, oplane, DRM_MODE_OBJECT_PLANE, "FB_ID", ov[ov_cur].fb);
 		ov_dirty = 0;
 	}
@@ -255,7 +278,11 @@ static void flip_done(int fd, unsigned int seq, unsigned int sec, unsigned int u
 		if (w != base_hz) nudges++;
 		want_hz = w;
 	}
-	if (on_screen >= 0 && on_screen != i)
+	if (novl)
+		novl_flip_done(novl);
+	/* The buffer that was on screen has been scanned out for a whole frame, so it is complete.
+	 * A snapshot may be waiting for exactly such a buffer; it requeues it when done. */
+	if (on_screen >= 0 && on_screen != i && !(novl && novl_hold(novl, on_screen)))
 		qbuf(on_screen);
 	on_screen = i;
 	pending = -1;
@@ -387,9 +414,9 @@ static int cmp_d(const void *a, const void *b)
 int main(int argc, char **argv)
 {
 	const char *text = "HDMI passthrough - Orange Pi 5 Ultra";
-	const char *logpath = NULL;
+	const char *logpath = NULL, *sockpath = NULL, *sockgroup = NULL;
 	int seconds = 0, quiet = 0, opt;
-	while ((opt = getopt(argc, argv, "t:s:n:fql:p:RL")) != -1) {
+	while ((opt = getopt(argc, argv, "t:s:n:fql:p:RLS:G:")) != -1) {
 		switch (opt) {
 		case 'R': reset_only = 1; break;
 		case 'p': target_ms = atof(optarg); break;
@@ -400,11 +427,16 @@ int main(int argc, char **argv)
 		case 'f': wait_fence = 1; break;
 		case 'q': quiet = 1; break;
 		case 'l': logpath = optarg; break;
-		default: die("usage: %s [-t text] [-s seconds] [-n buffers 2-%d] [-f] [-q] [-l log.csv] [-p phase_ms] [-L] [-R]", argv[0], MAXBUF);
+		case 'S': sockpath = optarg; break;
+		case 'G': sockgroup = optarg; break;
+		default: die("usage: %s [-t text] [-s seconds] [-n buffers 2-%d] [-f] [-q] [-l log.csv] [-p phase_ms] [-L] [-R] [-S socket [-G group]]", argv[0], MAXBUF);
 		}
 	}
 	if (nbuf < 2 || nbuf > MAXBUF)
 		die("buffers must be 2..%d", MAXBUF);
+	/* a snapshot keeps one capture buffer out of the queue while it copies the crop */
+	if (sockpath && nbuf < 6)
+		nbuf = 6;
 	if (logpath && !(logf = fopen(logpath, "w")))
 		die("open %s: %s", logpath, strerror(errno));
 	signal(SIGINT, on_sig);
@@ -546,12 +578,23 @@ int main(int argc, char **argv)
 			die("addfb capture: %s", strerror(errno));
 	}
 
-	/* overlay: two buffers so updates never tear */
+	/* overlay: two buffers so updates never tear. With -S the daemon draws it, so it covers the
+	 * whole output; otherwise it is the stats box. */
 	uint32_t ow = 1100, oh = 124;
-	if (ow > mode.hdisplay - 64) ow = mode.hdisplay - 64;
+	if (sockpath) {
+		ow = mode.hdisplay;
+		oh = mode.vdisplay;
+	} else if (ow > mode.hdisplay - 64) {
+		ow = mode.hdisplay - 64;
+	}
 	dumb_create(dfd, &ov[0], ow, oh);
 	dumb_create(dfd, &ov[1], ow, oh);
-	draw_text(&ov[0], text, "starting...");
+	if (sockpath) {
+		memset(ov[0].map, 0, ov[0].size);
+		memset(ov[1].map, 0, ov[1].size);
+	} else {
+		draw_text(&ov[0], text, "starting...");
+	}
 
 	/* video scaled to fit the screen, keeping aspect */
 	uint32_t dw = mode.hdisplay, dh = (uint64_t)mode.hdisplay * H / W;
@@ -603,7 +646,7 @@ int main(int argc, char **argv)
 	}
 	struct { uint32_t id, fb, sx, sy, sw, sh, cx, cy, cw, ch; uint64_t z; } pls[2] = {
 		{ vplane, bufs[b.index].fb, 0, 0, W, H, dx, dy, dw, dh, 0 },
-		{ oplane, ov[0].fb, 0, 0, ow, oh, 32, mode.vdisplay - oh - 32, ow, oh, 1 },
+		{ oplane, ov[0].fb, 0, 0, ow, oh, sockpath ? 0 : 32, sockpath ? 0 : mode.vdisplay - oh - 32, ow, oh, 1 },
 	};
 	for (int i = 0; i < 2; i++) {
 		add(req, dfd, pls[i].id, DRM_MODE_OBJECT_PLANE, "FB_ID", pls[i].fb);
@@ -624,6 +667,30 @@ int main(int argc, char **argv)
 	drmModeAtomicFree(req);
 	on_screen = b.index;
 
+	if (sockpath) {
+		/* Colour matrix and range as the receiver reports them; HD with nothing said is BT.709 limited. */
+		uint32_t cs = fmt.fmt.pix_mp.colorspace, enc = fmt.fmt.pix_mp.ycbcr_enc, q = fmt.fmt.pix_mp.quantization;
+		struct novl_source ns = {
+			.fmt = drmfmt == DRM_FORMAT_NV12 ? NOVL_NV12 : drmfmt == DRM_FORMAT_NV16 ? NOVL_NV16 : NOVL_NV24,
+			.width = W, .height = H, .stride = stride,
+			.size = fmt.fmt.pix_mp.plane_fmt[0].sizeimage,
+			.bt601 = enc == V4L2_YCBCR_ENC_601 || enc == V4L2_YCBCR_ENC_XV601 ||
+				 (enc == V4L2_YCBCR_ENC_DEFAULT && (cs == V4L2_COLORSPACE_SMPTE170M ||
+				  cs == V4L2_COLORSPACE_470_SYSTEM_M || cs == V4L2_COLORSPACE_470_SYSTEM_BG ||
+				  (cs == V4L2_COLORSPACE_DEFAULT && H < 720))),
+			.full_range = q == V4L2_QUANTIZATION_FULL_RANGE ||
+				      (q == V4L2_QUANTIZATION_DEFAULT && cs == V4L2_COLORSPACE_JPEG),
+			.nbuf = nbuf, .requeue = novl_requeue,
+		};
+		for (int i = 0; i < nbuf; i++)
+			ns.dmafd[i] = bufs[i].dmafd;
+		struct novl_overlay no = { .width = ow, .height = oh, .pitch = ov[0].pitch, .map = { ov[0].map, ov[1].map } };
+		novl = novl_start(sockpath, sockgroup, &ns, &no);
+		if (!novl)
+			die("cannot serve %s: %s", sockpath, strerror(errno));
+		fprintf(stderr, "edge daemon socket %s (overlay %ux%u, %s %s)\n", sockpath, ow, oh,
+			ns.bt601 ? "BT.601" : "BT.709", ns.full_range ? "full" : "limited");
+	}
 	drmEventContext ev = { .version = 2, .page_flip_handler = flip_done };
 	uint64_t t0 = now_ns(), tsec = t0;
 	char line2[160];
@@ -641,6 +708,8 @@ int main(int argc, char **argv)
 					break;
 				int i = b.index;
 				bufs[i].ts = (uint64_t)b.timestamp.tv_sec * 1000000000ull + (uint64_t)b.timestamp.tv_usec * 1000;
+				if (novl)
+					novl_frame(novl);
 				uint32_t fence;
 				memcpy(&fence, b.timecode.userbits, 4);
 				if (fence && fence != 0xffffffffu)
@@ -667,14 +736,17 @@ int main(int argc, char **argv)
 				fprintf(stderr, "%s  [commit->vblank %.2f ms, nudged frames %d]\n", line2,
 					lat_n ? cmt_sum / lat_n : 0, nudges);
 			nudges = 0;
-			int nxt = !ov_cur;
-			draw_text(&ov[nxt], text, line2);
-			ov_cur = nxt; ov_dirty = 1;
+			if (!novl) {	/* with -S the overlay is the daemon's */
+				int nxt = !ov_cur;
+				draw_text(&ov[nxt], text, line2);
+				ov_cur = nxt; ov_dirty = 1;
+			}
 			lat_sum = cmt_sum = 0; lat_n = dropped = 0; lat_min = 1e9; lat_max = 0;
 			tsec = t;
 		}
 	}
 
+	novl_stop(novl);	/* before STREAMOFF: it requeues buffers */
 	xioctl(vfd, VIDIOC_STREAMOFF, &type);
 	if (all_n) {
 		qsort(all_lat, all_n, sizeof *all_lat, cmp_d);

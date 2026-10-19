@@ -9,7 +9,7 @@ stdenv.mkDerivation {
   nativeBuildInputs = [ pkg-config ];
   buildInputs = [ libdrm cairo ];
   buildPhase = ''
-    $CC -O2 -Wall -o hdmi-passthru hdmi-passthru.c $(pkg-config --cflags --libs libdrm cairo)
+    $CC -O2 -Wall -pthread -o hdmi-passthru hdmi-passthru.c novl.c $(pkg-config --cflags --libs libdrm cairo)
   '';
   installPhase = ''
     install -Dm755 hdmi-passthru $out/bin/hdmi-passthru
