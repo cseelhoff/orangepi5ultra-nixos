@@ -98,6 +98,15 @@
         $out/lib/firmware/brcm/BCM.hcd
     '')
   ];
+
+  # The vendor bcmdhd driver opens its firmware by absolute path
+  # (/lib/firmware/fw_syn43711a0_sdio.bin, config_*.txt), not through the
+  # kernel firmware loader, so NixOS's /run/current-system/firmware is not
+  # searched; without this wlan0 fails with "fwpkg_init failed" when brought up.
+  systemd.tmpfiles.rules = [
+    "L+ /lib/firmware - - - - /run/current-system/firmware"
+  ];
+
   systemd.services.ap6611s-bluetooth = {
     description = "Attach the AP6611S Bluetooth controller on UART7";
     wantedBy = [ "bluetooth.target" "multi-user.target" ];
