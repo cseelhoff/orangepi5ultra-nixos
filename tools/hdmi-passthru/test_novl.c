@@ -464,8 +464,14 @@ static void test_flood(void)
 			usleep(3000);
 	}
 	CHECK(send_overlay(fd, 3, 4, 5, 6, 0xFF123456u) == 0);
-	for (int i = 0; i < 500 && !shown_is(3, 4, 5, 6, 0xFF123456u); i++)	/* the last update, behind a queue of earlier ones */
+	/* The last update comes behind a queue of earlier ones. Look at the shown buffer only once the loop has
+	 * taken nothing for 50 ms: while updates still arrive the server may rewrite it under the reader. */
+	for (int i = 0, last = -1, quiet = 0; i < 500 && quiet < 25; i++) {
+		int s = L.shown;
+		quiet = s == last ? quiet + 1 : 0;
+		last = s;
 		usleep(2000);
+	}
 	CHECK(shown_is(3, 4, 5, 6, 0xFF123456u));
 	CHECK(L.shown > 5);
 	CHECK(L.bad == 0);	/* every buffer the loop ever took was one whole overlay */
