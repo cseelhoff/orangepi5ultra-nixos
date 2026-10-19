@@ -3,7 +3,7 @@
 # Takes its kernel inputs from the board flake, so importing hosts need no
 # specialArgs and their nixpkgs version does not change the kernel.
 { nixos-rk3588, nixpkgs-kernel, pkgsKernel, kernel }:
-{ lib, ... }:
+{ lib, pkgs, ... }:
 {
   # Board module from nixos-rk3588, written for the 5 Plus (same RK3588 SoC and
   # vendor kernel); the Ultra-specific bits are overridden below.
@@ -24,6 +24,31 @@
 
   boot.kernelPackages = lib.mkForce (pkgsKernel.linuxPackagesFor kernel);
   hardware.deviceTree.name = lib.mkForce "rockchip/rk3588-orangepi-5-ultra.dtb";
+
+  # The vendor DT gives HDMI-RX's "hdmi" interrupt as SPI 436, a line only
+  # Rockchip's own BL31 raises (it takes the real SPI 178 as FIQ and forwards
+  # it). The SPI flash now runs upstream TF-A, so use the real line, as
+  # mainline does. Without it the receiver never saw source mode changes or
+  # audio except through the polling fallback in
+  # patches/hdmirx-without-vendor-tfa.patch.
+  hardware.deviceTree.overlays = [{
+    name = "hdmirx-irq-spi178";
+    dtsText = ''
+      /dts-v1/;
+      /plugin/;
+      / {
+        /* only this board: other RK3588 DTBs in the kernel lack the node path */
+        compatible = "rockchip,rk3588-orangepi-5-ultra";
+        fragment@0 {
+          target-path = "/hdmirx-controller@fdee0000";
+          __overlay__ {
+            /* GIC_SPI 177/178/179, IRQ_TYPE_LEVEL_HIGH: cec, hdmi, dma */
+            interrupts = <0 177 4>, <0 178 4>, <0 179 4>;
+          };
+        };
+      };
+    '';
+  }];
 
   # ======================================================================
   # !!! UNCONFIRMED WORKAROUND. THE REAL CAUSE IS PROBABLY ELECTRICAL. !!!
@@ -56,5 +81,33 @@
     scanRandMacAddress = false;
     macAddress = "permanent";
     powersave = false;
+  };
+
+  # Bluetooth: the AP6611S's BT side sits on UART7 (/dev/ttyS7). The vendor DT
+  # only powers it (rfkill "bt_default"); nothing attaches the HCI, so start
+  # btattach at boot. The 6.1 kernel's btbcm does not know the SYN43711 name
+  # and asks for brcm/BCM.hcd, so provide the Synaptics patch under that name;
+  # without it the chip runs its ROM firmware and finds no devices.
+  # Tested 2026-10-18: firmware "SYN43711 UART 37.4MHz AMPAK AP6611", LE scan
+  # finds nearby devices.
+  hardware.bluetooth.enable = lib.mkDefault true;
+  hardware.firmware = [
+    (pkgs.runCommand "ap6611s-bt-firmware" { } ''
+      mkdir -p $out/lib/firmware/brcm
+      cp ${pkgs.callPackage "${nixos-rk3588}/pkgs/orangepi-firmware" { }}/lib/firmware/SYN43711A0.hcd \
+        $out/lib/firmware/brcm/BCM.hcd
+    '')
+  ];
+  systemd.services.ap6611s-bluetooth = {
+    description = "Attach the AP6611S Bluetooth controller on UART7";
+    wantedBy = [ "bluetooth.target" "multi-user.target" ];
+    before = [ "bluetooth.service" ];
+    after = [ "dev-ttyS7.device" ];
+    serviceConfig = {
+      ExecStartPre = "${pkgs.util-linux}/bin/rfkill unblock bluetooth";
+      ExecStart = "${pkgs.bluez}/bin/btattach -B /dev/ttyS7 -P bcm -S 1500000";
+      Restart = "on-failure";
+      RestartSec = 5;
+    };
   };
 }

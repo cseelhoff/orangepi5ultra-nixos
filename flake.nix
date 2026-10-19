@@ -67,7 +67,8 @@
         gst-rockchip = pkgs.callPackage ./pkgs/gst-rockchip.nix { inherit (self.packages.${system}) rockchip-mpp librga; };
         hdmirx-record = pkgs.callPackage ./pkgs/hdmirx-record.nix { inherit (self.packages.${system}) gst-rockchip; };
         hdmirx-edid-sync = pkgs.callPackage ./pkgs/hdmirx-edid-sync.nix { };
-        hdmi-passthru = pkgs.callPackage ./pkgs/hdmi-passthru.nix { };
+        hdmi-passthru = pkgs.callPackage ./pkgs/hdmi-passthru.nix { inherit (self.packages.${system}) rockchip-mpp librga; };
+        hdmirx-audio-stream = pkgs.callPackage ./pkgs/hdmirx-audio-stream.nix { };
         sdImage = self.nixosConfigurations.opi5ultra.config.system.build.sdImage;
         default = self.packages.${system}.sdImage;
       };
