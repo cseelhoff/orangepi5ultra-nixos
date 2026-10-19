@@ -200,6 +200,7 @@ static void expected(int b, int x, int y, int bt601, int full, int out[3])
 /* ---------- harness ---------- */
 
 static char sock_path[108];
+static const char *sock_arg;	/* --serve: the path to listen on instead of a private one */
 static struct novl_source src;
 
 static void setup(enum novl_fmt f, int bt601, int full)
@@ -214,7 +215,10 @@ static void setup(enum novl_fmt f, int bt601, int full)
 	struct novl_overlay ov = { .width = OW, .height = OH, .pitch = OPITCH };
 	for (int i = 0; i < 2; i++)
 		L.ov[i] = ov.map[i] = calloc(OPITCH, OH);
-	snprintf(sock_path, sizeof sock_path, "/tmp/novl-test-%d.sock", (int)getpid());
+	if (sock_arg)
+		snprintf(sock_path, sizeof sock_path, "%s", sock_arg);
+	else
+		snprintf(sock_path, sizeof sock_path, "/tmp/novl-test-%d.sock", (int)getpid());
 	L.n = novl_start(sock_path, NULL, &src, &ov);
 	if (!L.n)
 		abort();
@@ -478,6 +482,7 @@ static void test_big_overlay_does_not_stall_the_loop(void)
 	usleep(200000);
 	CHECK(show(fd, 1, 1, 2, 2, 0xFFFEDCBAu));
 	CHECK(L.max_hook_us < 20000);	/* the loop's hooks never waited on the socket or the blit */
+	printf("novl: worst display-loop hook time while 40 full overlays were arriving: %ld us\n", (long)L.max_hook_us);
 	close(fd);
 	teardown();
 }
@@ -621,8 +626,16 @@ static void test_clients(void)
 	teardown();
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+	if (argc == 4 && !strcmp(argv[1], "--serve")) {	/* the server and a fake 60 Hz display loop, for novl_load */
+		sock_arg = argv[2];
+		setup(NOVL_NV12, 0, 0);
+		L.frame_ms = 16;
+		sleep((unsigned)atoi(argv[3]));
+		teardown();
+		return 0;
+	}
 	test_info_and_signal();
 	test_overlay();
 	test_no_write_while_scanned_out();

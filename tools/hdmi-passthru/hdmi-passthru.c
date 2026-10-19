@@ -180,6 +180,7 @@ static int vfd, dfd, nbuf = 4;
 static int on_screen = -1, pending = -1, latest = -1;
 static uint64_t pending_commit_ns;
 static uint32_t crtc_id, vplane, oplane;
+static uint32_t ov_fb_prop;	/* the overlay plane's FB_ID, looked up once so an overlay swap adds no ioctls to a commit */
 static struct dumb ov[2];
 static int ov_cur, ov_dirty;
 static struct novl *novl;	/* the edge daemon's server, with -S */
@@ -227,7 +228,7 @@ static void commit(int i)
 	if (novl) {
 		int o = novl_overlay_next(novl);
 		if (o >= 0)
-			add(req, dfd, oplane, DRM_MODE_OBJECT_PLANE, "FB_ID", ov[o].fb);
+			drmModeAtomicAddProperty(req, oplane, ov_fb_prop, ov[o].fb);
 	} else if (ov_dirty) {
 		add(req, dfd, oplane, DRM_MODE_OBJECT_PLANE, "FB_ID", ov[ov_cur].fb);
 		ov_dirty = 0;
@@ -546,6 +547,9 @@ int main(int argc, char **argv)
 	if (!oplane)
 		die("no overlay plane");
 	fprintf(stderr, "video plane %u, overlay plane %u\n", vplane, oplane);
+	ov_fb_prop = prop_id(dfd, oplane, DRM_MODE_OBJECT_PLANE, "FB_ID");
+	if (!ov_fb_prop)
+		die("overlay plane has no FB_ID");
 	uint64_t vz = 0, oz = 0;
 	prop_get(dfd, vplane, DRM_MODE_OBJECT_PLANE, "zpos", &vz, NULL, 0);
 	prop_get(dfd, oplane, DRM_MODE_OBJECT_PLANE, "zpos", &oz, NULL, 0);

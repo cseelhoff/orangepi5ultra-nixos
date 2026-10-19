@@ -9,6 +9,7 @@
 #include <linux/dma-buf.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -16,6 +17,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -44,14 +46,11 @@ struct novl {
 	atomic_int quit;
 	_Atomic uint64_t last_frame_ns;
 
-	pthread_mutex_t mu;
-	pthread_cond_t cv;
-	/* guarded by mu */
-	int ov_front;	/* the buffer the loop last took */
-	int ov_ready;	/* a finished buffer not yet taken, or -1 */
-	int ov_busy;	/* the commit that took ov_front has not latched: the other buffer may still be scanned out */
-	int snap_want;	/* a snapshot waits for the loop to hand over a capture buffer */
-	int snap_held;	/* the capture buffer handed over, or -1 */
+	/* The hand-over with the display loop is lock-free: the loop's hooks are a few atomic
+	 * operations and can never wait on this thread. The server thread polls for what it needs. */
+	_Atomic unsigned ovs;	/* overlay state, see ov_make(); zero is the right start */
+	atomic_int snap_want;	/* a snapshot waits for the loop to hand over a capture buffer */
+	atomic_int snap_held;	/* the capture buffer handed over, plus one; 0 for none */
 
 	struct rect dirty[2];	/* what was last drawn into each overlay buffer; server thread only */
 };
@@ -73,11 +72,20 @@ static void put32(uint8_t *p, int32_t v)
 	p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
 }
 
-/* mu held; 0 when woken, ETIMEDOUT at the deadline (the condvar runs on CLOCK_MONOTONIC) */
-static int wait_until(struct novl *n, uint64_t deadline_ns)
+/* The overlay buffers' state in one word, moved only by compare-and-swap:
+ *   bit 0     front: the buffer the loop last took
+ *   bits 1-2  ready: a finished buffer not yet taken, plus one (0: none)
+ *   bit 3     busy: the commit that took `front` has not latched, so the other buffer may still
+ *             be scanned out */
+static unsigned ov_make(unsigned front, int ready, unsigned busy) { return front | (unsigned)(ready + 1) << 1 | busy << 3; }
+static unsigned ov_front(unsigned s) { return s & 1; }
+static int ov_ready(unsigned s) { return (int)((s >> 1) & 3) - 1; }
+static unsigned ov_busy(unsigned s) { return (s >> 3) & 1; }
+
+static void micros(unsigned us)
 {
-	struct timespec ts = { .tv_sec = deadline_ns / 1000000000ull, .tv_nsec = deadline_ns % 1000000000ull };
-	return pthread_cond_timedwait(&n->cv, &n->mu, &ts);
+	struct timespec ts = { .tv_nsec = (long)us * 1000 };
+	nanosleep(&ts, NULL);
 }
 
 static int has_signal(struct novl *n)
@@ -86,7 +94,7 @@ static int has_signal(struct novl *n)
 	return t && now_ns() - t < SIGNAL_MS * 1000000ull;
 }
 
-/* ---------- hooks for the display loop ---------- */
+/* ---------- hooks for the display loop: wait-free, no locks, no system calls but the clock ---------- */
 
 void novl_frame(struct novl *n)
 {
@@ -95,38 +103,28 @@ void novl_frame(struct novl *n)
 
 int novl_overlay_next(struct novl *n)
 {
-	pthread_mutex_lock(&n->mu);
-	int r = n->ov_ready;
-	if (r >= 0) {
-		n->ov_front = r;
-		n->ov_ready = -1;
-		n->ov_busy = 1;
+	unsigned s = atomic_load(&n->ovs);
+	while (ov_ready(s) >= 0) {
+		int r = ov_ready(s);
+		if (atomic_compare_exchange_weak(&n->ovs, &s, ov_make((unsigned)r, -1, 1)))
+			return r;
 	}
-	pthread_mutex_unlock(&n->mu);
-	return r;
+	return -1;
 }
 
 void novl_flip_done(struct novl *n)
 {
-	pthread_mutex_lock(&n->mu);
-	if (n->ov_busy) {
-		n->ov_busy = 0;
-		pthread_cond_broadcast(&n->cv);
-	}
-	pthread_mutex_unlock(&n->mu);
+	unsigned s = atomic_load(&n->ovs);
+	while (ov_busy(s) && !atomic_compare_exchange_weak(&n->ovs, &s, ov_make(ov_front(s), ov_ready(s), 0)))
+		;
 }
 
 int novl_hold(struct novl *n, int index)
 {
-	pthread_mutex_lock(&n->mu);
-	int take = n->snap_want && n->snap_held < 0;
-	if (take) {
-		n->snap_held = index;
-		n->snap_want = 0;
-		pthread_cond_broadcast(&n->cv);
-	}
-	pthread_mutex_unlock(&n->mu);
-	return take;
+	if (!atomic_load(&n->snap_want) || !atomic_exchange(&n->snap_want, 0))
+		return 0;
+	atomic_store(&n->snap_held, index + 1);
+	return 1;
 }
 
 /* ---------- socket I/O (server thread) ---------- */
@@ -196,15 +194,26 @@ static int do_overlay(struct novl *n, uint32_t len)
 
 	/* The buffer to draw into is the one the loop is not showing. A finished but untaken
 	 * overlay is withdrawn first (this one replaces it), so the loop never takes a half-drawn
-	 * buffer. */
-	pthread_mutex_lock(&n->mu);
-	n->ov_ready = -1;
+	 * buffer. While the commit that took the front buffer has not latched, the other buffer
+	 * may still be scanned out, so wait for that (a few hundred microseconds of polling at most
+	 * per frame: the overlay is allowed to be a frame late, the video is not). */
+	int back = -1;
 	uint64_t deadline = now_ns() + FLIP_WAIT_MS * 1000000ull;
-	while (n->ov_busy && !n->quit && now_ns() < deadline)
-		wait_until(n, deadline);
-	int busy = n->ov_busy, back = 1 - n->ov_front;
-	pthread_mutex_unlock(&n->mu);
-	if (busy)
+	for (;;) {
+		unsigned s = atomic_load(&n->ovs);
+		if (ov_ready(s) >= 0) {
+			atomic_compare_exchange_strong(&n->ovs, &s, ov_make(ov_front(s), -1, ov_busy(s)));
+			continue;	/* look again: the loop may have taken it first */
+		}
+		if (!ov_busy(s)) {
+			back = 1 - (int)ov_front(s);
+			break;
+		}
+		if (n->quit || now_ns() >= deadline)
+			break;
+		micros(200);
+	}
+	if (back < 0)
 		return discard(n->cfd, len - 16);	/* the display is not flipping; the next update replaces this one */
 
 	clear_rect(n, back, n->dirty[back]);
@@ -234,9 +243,9 @@ static int do_overlay(struct novl *n, uint32_t len)
 		}
 		free(row);
 	}
-	pthread_mutex_lock(&n->mu);
-	n->ov_ready = back;
-	pthread_mutex_unlock(&n->mu);
+	unsigned s = atomic_load(&n->ovs);	/* nothing else moves it now: the state is (front, none, idle) */
+	while (!atomic_compare_exchange_weak(&n->ovs, &s, ov_make(ov_front(s), back, ov_busy(s))))
+		;
 	return 0;
 }
 
@@ -299,15 +308,19 @@ static int reply_snapshot(struct novl *n, int status, struct rect r, const uint8
 /* Waits for the loop to hand over a complete capture buffer; -1 if it does not. */
 static int take_stable_buffer(struct novl *n)
 {
-	pthread_mutex_lock(&n->mu);
-	n->snap_want = 1;
+	atomic_store(&n->snap_want, 1);
 	uint64_t deadline = now_ns() + HOLD_WAIT_MS * 1000000ull;
-	while (n->snap_held < 0 && !n->quit && now_ns() < deadline)
-		wait_until(n, deadline);
-	int b = n->snap_held;
-	n->snap_want = 0;
-	pthread_mutex_unlock(&n->mu);
-	return b;
+	int held;
+	while (!(held = atomic_load(&n->snap_held)) && !n->quit && now_ns() < deadline)
+		micros(500);
+	if (!held && atomic_exchange(&n->snap_want, 0))
+		return -1;	/* the offer stood and nobody took it */
+	/* The loop took it just now and is about to say which buffer. */
+	for (int i = 0; i < 1000 && !held; i++) {
+		micros(100);
+		held = atomic_load(&n->snap_held);
+	}
+	return held - 1;
 }
 
 static int do_snapshot(struct novl *n, uint32_t len)
@@ -347,9 +360,7 @@ static int do_snapshot(struct novl *n, uint32_t len)
 		status = ST_OK;
 	}
 	s->requeue(s->ctx, b);
-	pthread_mutex_lock(&n->mu);
-	n->snap_held = -1;
-	pthread_mutex_unlock(&n->mu);
+	atomic_store(&n->snap_held, 0);
 
 	int rc = reply_snapshot(n, status, status == ST_OK ? r : none, rgb);
 	free(rgb);
@@ -390,6 +401,11 @@ static void *serve(void *arg)
 	sigset_t all;
 	sigfillset(&all);
 	pthread_sigmask(SIG_BLOCK, &all, NULL);	/* Ctrl-C must interrupt the display loop's poll, not this thread's */
+	/* The display loop is the latency path. A batch-policy thread does not preempt the thread it
+	 * wakes up next to (CFS), and nice 10 gives it a small share when they do compete. Best effort. */
+	struct sched_param sp = { 0 };
+	sched_setscheduler(0, SCHED_BATCH, &sp);	/* pid 0: this thread, on Linux */
+	setpriority(PRIO_PROCESS, 0, 10);
 	struct timeval tv = { .tv_sec = IO_TIMEOUT_S };
 	while (!n->quit) {
 		struct pollfd pf[2] = { { n->lfd, POLLIN, 0 }, { n->cfd, POLLIN, 0 } };	/* a negative fd is ignored */
@@ -435,7 +451,6 @@ struct novl *novl_start(const char *path, const char *group, const struct novl_s
 	n->src = *src;
 	n->ov = *ov;
 	n->lfd = n->cfd = -1;
-	n->ov_ready = n->snap_held = -1;
 	struct sockaddr_un a = { .sun_family = AF_UNIX };
 	if (strlen(path) >= sizeof a.sun_path) {
 		errno = ENAMETOOLONG;
@@ -461,12 +476,6 @@ struct novl *novl_start(const char *path, const char *group, const struct novl_s
 	if (g && chown(path, (uid_t)-1, g->gr_gid))
 		return fail(n, path);
 
-	pthread_condattr_t ca;
-	pthread_condattr_init(&ca);
-	pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
-	pthread_mutex_init(&n->mu, NULL);
-	pthread_cond_init(&n->cv, &ca);
-	pthread_condattr_destroy(&ca);
 	if ((errno = pthread_create(&n->thread, NULL, serve, n)))
 		return fail(n, "thread");
 	return n;
@@ -477,15 +486,10 @@ void novl_stop(struct novl *n)
 	if (!n)
 		return;
 	n->quit = 1;
-	pthread_mutex_lock(&n->mu);
-	pthread_cond_broadcast(&n->cv);
-	pthread_mutex_unlock(&n->mu);
 	pthread_join(n->thread, NULL);
 	if (n->cfd >= 0)
 		close(n->cfd);
 	close(n->lfd);
 	unlink(n->path);
-	pthread_cond_destroy(&n->cv);
-	pthread_mutex_destroy(&n->mu);
 	free(n);
 }

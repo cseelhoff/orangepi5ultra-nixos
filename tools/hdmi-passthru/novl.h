@@ -49,7 +49,8 @@ struct novl *novl_start(const char *path, const char *group, const struct novl_s
 			const struct novl_overlay *ov);
 void novl_stop(struct novl *n);
 
-/* ---- hooks for the display loop; all cheap and non-blocking ---- */
+/* ---- hooks for the display loop; wait-free (a few atomic operations, no locks), so they can
+ * never delay a frame ---- */
 
 /* A capture frame arrived: the signal is alive. */
 void novl_frame(struct novl *n);
