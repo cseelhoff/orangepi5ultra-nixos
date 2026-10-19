@@ -19,7 +19,8 @@
 //   -q  quiet: no per-second stats on stderr
 //   -R  only repair a display left in a bad state (refresh range, plane order)
 //   -S  serve the Natively edge daemon on this Unix socket (see novl.h): it draws the overlay,
-//       which then covers the whole output instead of the stats box, and asks for screenshots.
+//       which then covers the whole output instead of the stats box, and asks for screenshots
+//       (a hardware JPEG of the whole picture, like -o; needs NV12; -W and -Q apply to both).
 //       The socket is mode 0660, group -G. At least 6 capture buffers are used (8 with -o).
 //
 // Snapshots (hardware JPEG, on a worker thread; the display path never waits):
@@ -252,6 +253,13 @@ static void novl_requeue(void *ctx, int i)
 {
 	(void)ctx;
 	qbuf_try(i);
+}
+
+/* the edge daemon's screenshot: RGA + MPP JPEG straight from the capture buffer, no CPU pixel work */
+static int novl_encode(void *ctx, int i, void **jpeg, size_t *len)
+{
+	(void)ctx;
+	return snap_grab(bufs[i].dmafd, bufsize, jpeg, len);
 }
 
 static void commit(int i)
@@ -630,7 +638,7 @@ int main(int argc, char **argv)
 	}
 
 	bufsize = (size_t)stride * H * (drmfmt == DRM_FORMAT_NV12 ? 3 : drmfmt == DRM_FORMAT_NV16 ? 4 : 6) / 2;
-	if (snap_dir) {
+	if (snap_dir || sockpath) {	/* -o files and the edge daemon's screenshots share one encoder */
 		if (drmfmt != DRM_FORMAT_NV12)
 			die("snapshots need NV12 capture");
 		if (snap_init(W, H, stride, snap_width, snap_quality, snap_dir, snap_keep_all, snap_done, NULL))
@@ -727,28 +735,12 @@ int main(int argc, char **argv)
 	on_screen = b.index;
 
 	if (sockpath) {
-		/* Colour matrix and range as the receiver reports them; HD with nothing said is BT.709 limited. */
-		uint32_t cs = fmt.fmt.pix_mp.colorspace, enc = fmt.fmt.pix_mp.ycbcr_enc, q = fmt.fmt.pix_mp.quantization;
-		struct novl_source ns = {
-			.fmt = drmfmt == DRM_FORMAT_NV12 ? NOVL_NV12 : drmfmt == DRM_FORMAT_NV16 ? NOVL_NV16 : NOVL_NV24,
-			.width = W, .height = H, .stride = stride,
-			.size = fmt.fmt.pix_mp.plane_fmt[0].sizeimage,
-			.bt601 = enc == V4L2_YCBCR_ENC_601 || enc == V4L2_YCBCR_ENC_XV601 ||
-				 (enc == V4L2_YCBCR_ENC_DEFAULT && (cs == V4L2_COLORSPACE_SMPTE170M ||
-				  cs == V4L2_COLORSPACE_470_SYSTEM_M || cs == V4L2_COLORSPACE_470_SYSTEM_BG ||
-				  (cs == V4L2_COLORSPACE_DEFAULT && H < 720))),
-			.full_range = q == V4L2_QUANTIZATION_FULL_RANGE ||
-				      (q == V4L2_QUANTIZATION_DEFAULT && cs == V4L2_COLORSPACE_JPEG),
-			.nbuf = nbuf, .requeue = novl_requeue,
-		};
-		for (int i = 0; i < nbuf; i++)
-			ns.dmafd[i] = bufs[i].dmafd;
+		struct novl_source ns = { .width = W, .height = H, .encode = novl_encode, .requeue = novl_requeue };
 		struct novl_overlay no = { .width = ow, .height = oh, .pitch = ov[0].pitch, .map = { ov[0].map, ov[1].map } };
 		novl = novl_start(sockpath, sockgroup, &ns, &no);
 		if (!novl)
 			die("cannot serve %s: %s", sockpath, strerror(errno));
-		fprintf(stderr, "edge daemon socket %s (overlay %ux%u, %s %s)\n", sockpath, ow, oh,
-			ns.bt601 ? "BT.601" : "BT.709", ns.full_range ? "full" : "limited");
+		fprintf(stderr, "edge daemon socket %s (overlay %ux%u)\n", sockpath, ow, oh);
 	}
 	drmEventContext ev = { .version = 2, .page_flip_handler = flip_done };
 	uint64_t t0 = now_ns(), tsec = t0;
@@ -817,8 +809,8 @@ int main(int argc, char **argv)
 		}
 	}
 
-	novl_stop(novl);	/* before STREAMOFF: it requeues buffers */
-	if (snap_dir)
+	novl_stop(novl);	/* before STREAMOFF: it requeues buffers; and before the encoder it may be using goes */
+	if (snap_dir || sockpath)
 		snap_close();
 	xioctl(vfd, VIDIOC_STREAMOFF, &type);
 	if (all_n) {

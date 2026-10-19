@@ -36,12 +36,15 @@ static struct {
 	pthread_t th;
 	atomic_int run, paused, flip_ms, frame_ms;
 	atomic_int shown, last_shown, bad;
-	atomic_int holds, last_hold;
+	atomic_int holds, last_hold, frames;
 	atomic_int state[NBUF];	/* 0 queued, 1 on screen, 2 held by a snapshot */
 	atomic_long max_hook_us;
 	int on_screen;
 	uint8_t *ov[2];
 } L;
+
+/* the fake hardware encoder's knobs and what it saw */
+static struct { atomic_int calls, fail, delay_ms, encoding, last_index, state_at_encode; } E;
 
 static uint64_t now_us(void)
 {
@@ -53,7 +56,7 @@ static uint64_t now_us(void)
 static void requeue(void *ctx, int i)
 {
 	(void)ctx;
-	if (atomic_exchange(&L.state[i], 0) != 2)
+	if (atomic_exchange(&L.state[i], 0) != 2 || E.encoding)	/* it must be held, and not still being encoded */
 		L.bad++;
 }
 
@@ -93,6 +96,7 @@ static void *display_loop(void *arg)
 		if (L.paused)
 			continue;
 		novl_frame(L.n);
+		L.frames++;
 		int i = -1;
 		for (int b = 0; b < NBUF && i < 0; b++)
 			if (L.state[b] == 0)
@@ -142,59 +146,41 @@ static void *display_loop(void *arg)
 	return NULL;
 }
 
-/* ---------- a source with known pixels ---------- */
+/* ---------- a fake hardware encoder ---------- */
 
-static enum novl_fmt cur_fmt;
+/* The "JPEG" of a buffer: markers, the buffer index and a pattern that depends on it, so a test can tell which
+ * buffer was encoded. It also checks what the real encoder relies on: the buffer is held while it works. */
+#define FAKE_JPEG_LEN 3000
 
-static int chroma_pitch(enum novl_fmt f) { return f == NOVL_NV24 ? SSTRIDE * 2 : SSTRIDE; }
-static int chroma_rows(enum novl_fmt f) { return f == NOVL_NV12 ? SH / 2 : SH; }
-static int Y_at(int b, int x, int y) { return 16 + (x * 3 + y * 5 + b * 40) % 200; }
-static int U_at(int b, int cx, int cy) { return 64 + (cx * 7 + cy * 3 + b * 11) % 128; }
-static int V_at(int b, int cx, int cy) { return 64 + (cx * 5 + cy * 9 + b * 17) % 128; }
-
-static size_t source_size(enum novl_fmt f) { return (size_t)SSTRIDE * SH + (size_t)chroma_pitch(f) * chroma_rows(f); }
-
-static int make_buffer(enum novl_fmt f, int b)
+static int fake_encode(void *ctx, int index, void **jpeg, size_t *len)
 {
-	size_t size = source_size(f);
-	int fd = memfd_create("novl-test", MFD_CLOEXEC);
-	if (fd < 0 || ftruncate(fd, (off_t)size))
-		abort();
-	uint8_t *m = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-	for (int y = 0; y < SH; y++)
-		for (int x = 0; x < SW; x++)
-			m[y * SSTRIDE + x] = (uint8_t)Y_at(b, x, y);
-	uint8_t *c = m + (size_t)SSTRIDE * SH;
-	int cw = f == NOVL_NV24 ? SW : SW / 2;
-	for (int cy = 0; cy < chroma_rows(f); cy++)
-		for (int cx = 0; cx < cw; cx++) {
-			c[(size_t)cy * chroma_pitch(f) + cx * 2] = (uint8_t)U_at(b, cx, cy);
-			c[(size_t)cy * chroma_pitch(f) + cx * 2 + 1] = (uint8_t)V_at(b, cx, cy);
-		}
-	munmap(m, size);
-	return fd;
+	(void)ctx;
+	E.calls++;
+	E.last_index = index;
+	E.state_at_encode = L.state[index];
+	E.encoding = 1;
+	if (E.delay_ms)
+		usleep((unsigned)E.delay_ms * 1000);
+	E.encoding = 0;
+	if (E.fail)
+		return -1;
+	uint8_t *p = malloc(FAKE_JPEG_LEN);
+	for (int i = 0; i < FAKE_JPEG_LEN; i++)
+		p[i] = (uint8_t)(i * 7 + index);
+	p[0] = 0xFF; p[1] = 0xD8; p[2] = (uint8_t)index; p[FAKE_JPEG_LEN - 2] = 0xFF; p[FAKE_JPEG_LEN - 1] = 0xD9;
+	*jpeg = p;
+	*len = FAKE_JPEG_LEN;
+	return 0;
 }
 
-/* The picture as an independent float derivation (not the code's fixed-point coefficients). */
-static void ref_rgb(int Y, int U, int V, int bt601, int full, int out[3])
+static int jpeg_is_buffer(const uint8_t *p, size_t n, int index)
 {
-	double kr = bt601 ? 0.299 : 0.2126, kb = bt601 ? 0.114 : 0.0722, kg = 1 - kr - kb;
-	double y = full ? Y / 255.0 : (Y - 16) / 219.0;
-	double cb = (U - 128) / (full ? 255.0 : 224.0), cr = (V - 128) / (full ? 255.0 : 224.0);
-	double r = y + 2 * (1 - kr) * cr, b = y + 2 * (1 - kb) * cb, g = (y - kr * r - kb * b) / kg;
-	double v[3] = { r, g, b };
-	for (int i = 0; i < 3; i++) {
-		double d = v[i] * 255 + 0.5;
-		out[i] = d < 0 ? 0 : d > 255 ? 255 : (int)d;
-	}
-}
-
-static void expected(int b, int x, int y, int bt601, int full, int out[3])
-{
-	int cx = x >> 1, cy = cur_fmt == NOVL_NV12 ? y >> 1 : y;
-	if (cur_fmt == NOVL_NV24)
-		cx = x;
-	ref_rgb(Y_at(b, x, y), U_at(b, cx, cy), V_at(b, cx, cy), bt601, full, out);
+	if (n != FAKE_JPEG_LEN || p[0] != 0xFF || p[1] != 0xD8 || p[2] != (uint8_t)index || p[n - 2] != 0xFF || p[n - 1] != 0xD9)
+		return 0;
+	for (size_t i = 3; i < n - 2; i++)
+		if (p[i] != (uint8_t)(i * 7 + index))
+			return 0;
+	return 1;
 }
 
 /* ---------- harness ---------- */
@@ -203,15 +189,11 @@ static char sock_path[108];
 static const char *sock_arg;	/* --serve: the path to listen on instead of a private one */
 static struct novl_source src;
 
-static void setup(enum novl_fmt f, int bt601, int full)
+static void setup(void)
 {
-	cur_fmt = f;
 	memset(&src, 0, sizeof src);
-	src.fmt = f; src.width = SW; src.height = SH; src.stride = SSTRIDE; src.size = source_size(f);
-	src.bt601 = bt601; src.full_range = full; src.nbuf = NBUF;
-	for (int b = 0; b < NBUF; b++)
-		src.dmafd[b] = make_buffer(f, b);
-	src.requeue = requeue;
+	src.width = SW; src.height = SH; src.encode = fake_encode; src.requeue = requeue;
+	E.calls = E.fail = E.delay_ms = E.encoding = E.last_index = E.state_at_encode = 0;
 	struct novl_overlay ov = { .width = OW, .height = OH, .pitch = OPITCH };
 	for (int i = 0; i < 2; i++)
 		L.ov[i] = ov.map[i] = calloc(OPITCH, OH);
@@ -238,8 +220,6 @@ static void teardown(void)
 	novl_stop(L.n);
 	for (int i = 0; i < 2; i++)
 		free(L.ov[i]);
-	for (int b = 0; b < NBUF; b++)
-		close(src.dmafd[b]);
 }
 
 static void put32(uint8_t *p, int32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); }
@@ -335,8 +315,8 @@ static int shown_is(int x, int y, int w, int h, uint32_t color)
 	return bx == x && by == y && bw == w && bh == h && c == color;
 }
 
-/* returns the reply status, or -1 if there was no proper reply; *rgb is malloc'd on success */
-static int snapshot(int fd, int x, int y, int w, int h, int rect[4], int src_wh[2], uint8_t **rgb)
+/* returns the reply status, or -1 if there was no proper reply; *jpeg is malloc'd when the reply has a payload */
+static int snapshot(int fd, int x, int y, int w, int h, int rect[4], int src_wh[2], uint8_t **jpeg, size_t *jlen)
 {
 	uint8_t req[16], hd[12], meta[28];
 	put32(req, x); put32(req + 4, y); put32(req + 8, w); put32(req + 12, h);
@@ -345,11 +325,11 @@ static int snapshot(int fd, int x, int y, int w, int h, int rect[4], int src_wh[
 	for (int i = 0; i < 4; i++)
 		rect[i] = get32(meta + i * 4);
 	src_wh[0] = get32(meta + 16); src_wh[1] = get32(meta + 20);
-	size_t pixels = (size_t)get32(hd + 8) - 28;
-	*rgb = NULL;
-	if (pixels) {
-		*rgb = malloc(pixels);
-		if (recv_n(fd, *rgb, pixels))
+	*jlen = (size_t)get32(hd + 8) - 28;
+	*jpeg = NULL;
+	if (*jlen) {
+		*jpeg = malloc(*jlen);
+		if (recv_n(fd, *jpeg, *jlen))
 			return -1;
 	}
 	return get32(meta + 24);
@@ -359,16 +339,18 @@ static int snapshot(int fd, int x, int y, int w, int h, int rect[4], int src_wh[
 
 static void test_info_and_signal(void)
 {
-	setup(NOVL_NV12, 0, 0);
+	setup();
 	L.paused = 1;	/* no frame yet */
 	int fd = cli_connect(), v[5];
 	CHECK(fd >= 0 && info(fd, v) == 0);
 	CHECK(v[0] == SW && v[1] == SH && v[2] == OW && v[3] == OH);
 	CHECK(v[4] == 0);
 	int rect[4], wh[2];
-	uint8_t *rgb;
-	CHECK(snapshot(fd, 0, 0, 0, 0, rect, wh, &rgb) == 1);	/* no signal */
-	free(rgb);
+	uint8_t *jpeg;
+	size_t jlen;
+	CHECK(snapshot(fd, 0, 0, 0, 0, rect, wh, &jpeg, &jlen) == 1);	/* no signal */
+	CHECK(jlen == 0 && E.calls == 0);	/* and the encoder was not troubled */
+	free(jpeg);
 
 	L.paused = 0;
 	usleep(60000);
@@ -376,15 +358,15 @@ static void test_info_and_signal(void)
 	L.paused = 1;
 	usleep(700000);
 	CHECK(info(fd, v) == 0 && v[4] == 0);	/* frames stopped: no signal again */
-	CHECK(snapshot(fd, 0, 0, 0, 0, rect, wh, &rgb) == 1);
-	free(rgb);
+	CHECK(snapshot(fd, 0, 0, 0, 0, rect, wh, &jpeg, &jlen) == 1);
+	free(jpeg);
 	close(fd);
 	teardown();
 }
 
 static void test_overlay(void)
 {
-	setup(NOVL_NV12, 0, 0);
+	setup();
 	int fd = cli_connect();
 	CHECK(fd >= 0);
 	CHECK(show(fd, 10, 20, 30, 15, 0xFF112233u));
@@ -417,7 +399,7 @@ static void test_overlay(void)
 
 static void test_no_write_while_scanned_out(void)
 {
-	setup(NOVL_NV12, 0, 0);
+	setup();
 	int fd = cli_connect();
 	CHECK(show(fd, 0, 0, 10, 10, 0xFF0000FFu));
 	L.flip_ms = 100;	/* the next commit is slow to latch (a real one takes 16 ms; the server waits up to 200) */
@@ -437,7 +419,7 @@ static void test_no_write_while_scanned_out(void)
 
 static void test_stalled_flip_drops_one_update(void)
 {
-	setup(NOVL_NV12, 0, 0);
+	setup();
 	int fd = cli_connect();
 	CHECK(show(fd, 0, 0, 10, 10, 0xFF0000FFu));
 	L.flip_ms = 450;	/* a display that stops latching: the server waits 200 ms, then gives up on that update */
@@ -454,7 +436,7 @@ static void test_stalled_flip_drops_one_update(void)
 
 static void test_flood(void)
 {
-	setup(NOVL_NV12, 0, 0);
+	setup();
 	int fd = cli_connect();
 	srand(7);
 	for (int i = 0; i < 400; i++) {
@@ -481,7 +463,7 @@ static void test_flood(void)
 
 static void test_big_overlay_does_not_stall_the_loop(void)
 {
-	setup(NOVL_NV12, 0, 0);
+	setup();
 	int fd = cli_connect();
 	for (int i = 0; i < 40; i++)
 		CHECK(send_overlay(fd, 0, 0, OW, OH, 0xFF000000u | (uint32_t)(i + 1)) == 0);
@@ -493,96 +475,63 @@ static void test_big_overlay_does_not_stall_the_loop(void)
 	teardown();
 }
 
-static void check_snapshot_case(enum novl_fmt f, int bt601, int full)
+static void test_snapshot(void)
 {
-	setup(f, bt601, full);
+	setup();
 	int fd = cli_connect(), rect[4], wh[2];
-	uint8_t *rgb;
+	uint8_t *jpeg;
+	size_t jlen;
 	usleep(50000);
-	int rc = snapshot(fd, 0, 0, 0, 0, rect, wh, &rgb);
-	CHECK(rc == 0 && rect[0] == 0 && rect[1] == 0 && rect[2] == SW && rect[3] == SH && wh[0] == SW && wh[1] == SH);
-	int held = L.last_hold, worst = 0;
-	if (rc == 0)
-		for (int y = 0; y < SH; y++)
-			for (int x = 0; x < SW; x++) {
-				int e[3];
-				expected(held, x, y, bt601, full, e);
-				for (int k = 0; k < 3; k++) {
-					int d = abs(e[k] - rgb[((size_t)y * SW + x) * 3 + k]);
-					if (d > worst)
-						worst = d;
-				}
-			}
-	CHECK(worst <= 2);	/* fixed point against a float derivation */
-	free(rgb);
 
-	/* a crop: the same pixels as the full picture's, at the right place */
-	rc = snapshot(fd, 9, 7, 21, 13, rect, wh, &rgb);
-	CHECK(rc == 0 && rect[0] == 9 && rect[1] == 7 && rect[2] == 21 && rect[3] == 13);
-	if (rc == 0) {
-		worst = 0;
-		held = L.last_hold;
-		for (int y = 0; y < 13; y++)
-			for (int x = 0; x < 21; x++) {
-				int e[3];
-				expected(held, 9 + x, 7 + y, bt601, full, e);
-				for (int k = 0; k < 3; k++) {
-					int d = abs(e[k] - rgb[((size_t)y * 21 + x) * 3 + k]);
-					if (d > worst)
-						worst = d;
-				}
-			}
-		CHECK(worst <= 2);
-	}
-	free(rgb);
-	close(fd);
-	teardown();
-}
+	/* the reply is the JPEG of the buffer that was held, of the whole picture, whatever rectangle was asked for */
+	CHECK(snapshot(fd, 0, 0, 0, 0, rect, wh, &jpeg, &jlen) == 0);
+	CHECK(rect[0] == 0 && rect[1] == 0 && rect[2] == SW && rect[3] == SH && wh[0] == SW && wh[1] == SH);
+	CHECK(jpeg_is_buffer(jpeg, jlen, E.last_index));
+	CHECK(E.state_at_encode == 2);	/* it was held while it was encoded */
+	free(jpeg);
+	CHECK(snapshot(fd, 9, 7, 21, 13, rect, wh, &jpeg, &jlen) == 0);
+	CHECK(rect[0] == 0 && rect[1] == 0 && rect[2] == SW && rect[3] == SH);	/* the receiver crops */
+	CHECK(jpeg_is_buffer(jpeg, jlen, E.last_index));
+	free(jpeg);
 
-static void test_snapshot_formats(void)
-{
-	for (int f = NOVL_NV12; f <= NOVL_NV24; f++)
-		for (int bt601 = 0; bt601 < 2; bt601++)
-			for (int full = 0; full < 2; full++)
-				check_snapshot_case((enum novl_fmt)f, bt601, full);
-}
-
-static void test_snapshot_clamping_and_holds(void)
-{
-	setup(NOVL_NV12, 0, 0);
-	int fd = cli_connect(), rect[4], wh[2];
-	uint8_t *rgb;
-	usleep(50000);
-	CHECK(snapshot(fd, SW - 5, SH - 4, 100, 100, rect, wh, &rgb) == 0);	/* clamped to the picture */
-	CHECK(rect[0] == SW - 5 && rect[1] == SH - 4 && rect[2] == 5 && rect[3] == 4);
-	free(rgb);
-	CHECK(snapshot(fd, -10, -10, 20, 20, rect, wh, &rgb) == 0);
-	CHECK(rect[0] == 0 && rect[1] == 0 && rect[2] == 10 && rect[3] == 10);
-	free(rgb);
-	CHECK(snapshot(fd, SW + 3, 0, 10, 10, rect, wh, &rgb) == 2 && rgb == NULL);	/* nothing of it is inside */
-	CHECK(snapshot(fd, 0, 0, 10, 10, rect, wh, &rgb) == 0);	/* and the stream is still in step */
-	free(rgb);
-
-	/* many snapshots: every buffer comes back, the loop keeps running */
-	int frames = L.shown;
-	(void)frames;
+	/* many snapshots: every buffer comes back, none while still being encoded, the loop keeps running */
 	for (int i = 0; i < 30; i++) {
-		CHECK(snapshot(fd, 0, 0, 8, 8, rect, wh, &rgb) == 0);
-		free(rgb);
+		CHECK(snapshot(fd, 0, 0, 0, 0, rect, wh, &jpeg, &jlen) == 0);
+		CHECK(jpeg_is_buffer(jpeg, jlen, E.last_index));
+		free(jpeg);
 	}
-	CHECK(L.holds >= 30);
+	CHECK(L.holds >= 32 && E.calls >= 32);
 	CHECK(L.bad == 0);
 
-	/* the loop stops after a frame: the signal is still alive but nothing can be handed over */
+	/* a slow encoder is no failure: the server has no patience limit of its own, and the display loop never notices */
+	E.delay_ms = 900;
+	int frames = L.frames;
+	uint64_t t0 = now_us();
+	CHECK(snapshot(fd, 0, 0, 0, 0, rect, wh, &jpeg, &jlen) == 0);
+	CHECK(now_us() - t0 >= 850000);
+	CHECK(L.frames - frames > 100);	/* 900 ms at 4 ms a frame is ~225: the loop kept going */
+	free(jpeg);
+	E.delay_ms = 0;
+
+	/* an encoder failure is status 2 with no payload; the buffer still goes back and the next one works */
+	E.fail = 1;
+	CHECK(snapshot(fd, 0, 0, 0, 0, rect, wh, &jpeg, &jlen) == 2 && jlen == 0);
+	free(jpeg);
+	E.fail = 0;
+	CHECK(snapshot(fd, 0, 0, 0, 0, rect, wh, &jpeg, &jlen) == 0);
+	free(jpeg);
+
+	/* the loop stops flipping while the signal is still alive: nothing can be handed over, and it says so (no hang) */
 	L.paused = 1;
 	usleep(20000);
-	uint64_t t0 = now_us();
-	CHECK(snapshot(fd, 0, 0, 8, 8, rect, wh, &rgb) == 2);
-	CHECK(now_us() - t0 < 380000);	/* inside the daemon's 400 ms patience */
+	t0 = now_us();
+	CHECK(snapshot(fd, 0, 0, 0, 0, rect, wh, &jpeg, &jlen) == 1);	/* by then there is no signal */
+	CHECK(now_us() - t0 < 1800000);
+	free(jpeg);
 	L.paused = 0;
 	usleep(80000);
-	CHECK(snapshot(fd, 0, 0, 8, 8, rect, wh, &rgb) == 0);	/* the abandoned request left nothing behind */
-	free(rgb);
+	CHECK(snapshot(fd, 0, 0, 0, 0, rect, wh, &jpeg, &jlen) == 0);	/* the abandoned request left nothing behind */
+	free(jpeg);
 	L.run = 0;
 	pthread_join(L.th, NULL);
 	int held = 0;
@@ -598,7 +547,7 @@ static void test_snapshot_clamping_and_holds(void)
 
 static void test_clients(void)
 {
-	setup(NOVL_NV12, 0, 0);
+	setup();
 	int a = cli_connect(), b, v[5];
 	CHECK(a >= 0 && info(a, v) == 0);
 	b = cli_connect();	/* a new connection replaces the old one */
@@ -636,7 +585,7 @@ int main(int argc, char **argv)
 {
 	if (argc == 4 && !strcmp(argv[1], "--serve")) {	/* the server and a fake 60 Hz display loop, for novl_load */
 		sock_arg = argv[2];
-		setup(NOVL_NV12, 0, 0);
+		setup();
 		L.frame_ms = 16;
 		sleep((unsigned)atoi(argv[3]));
 		teardown();
@@ -648,8 +597,7 @@ int main(int argc, char **argv)
 	test_stalled_flip_drops_one_update();
 	test_flood();
 	test_big_overlay_does_not_stall_the_loop();
-	test_snapshot_formats();
-	test_snapshot_clamping_and_holds();
+	test_snapshot();
 	test_clients();
 	printf("novl: %d checks, %d failed\n", checks, failures);
 	return failures != 0;

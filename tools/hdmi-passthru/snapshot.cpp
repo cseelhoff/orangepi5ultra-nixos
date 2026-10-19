@@ -31,13 +31,14 @@ static struct {
 	/* config */
 	int in_w, in_h, in_stride;
 	int out_w, out_h;
-	char dir[512];
+	char dir[512];	/* empty: no files, only snap_grab() */
 	int keep_all;
 	/* MPP */
 	MppCtx ctx;
 	MppApi *mpi;
 	MppBufferGroup grp;
 	MppBuffer pkt_buf;
+	pthread_mutex_t enc;	/* one encode at a time: the worker's and snap_grab()'s share MPP, the packet and the scale buffer */
 	/* RGA scale target */
 	int scaled_fd;
 	size_t scaled_size;
@@ -93,7 +94,8 @@ static int write_file(const char *path, const void *data, size_t len)
 	return rename(tmp, path); /* readers never see a half-written file */
 }
 
-static int encode(int fd, size_t size)
+/* out != NULL: the JPEG goes to a malloc'd block there (and *outlen); otherwise to the files. */
+static int encode(int fd, size_t size, void **out_jpeg, size_t *out_len)
 {
 	int w = S.in_w, h = S.in_h, hstride = S.in_stride, vstride = S.in_h;
 
@@ -151,18 +153,27 @@ static int encode(int fd, size_t size)
 		if (S.mpi->encode_get_packet(S.ctx, &out) == MPP_OK && out) {
 			const void *data = mpp_packet_get_pos(out);
 			size_t len = mpp_packet_get_length(out);
-			char path[600];
-			snprintf(path, sizeof path, "%s/latest.jpg", S.dir);
-			ret = write_file(path, data, len);
-			if (!ret && S.keep_all) {
-				struct timeval tv;
-				gettimeofday(&tv, NULL);
-				struct tm tm;
-				localtime_r(&tv.tv_sec, &tm);
-				char ts[64];
-				strftime(ts, sizeof ts, "%Y%m%d-%H%M%S", &tm);
-				snprintf(path, sizeof path, "%s/snap-%s.%03ld.jpg", S.dir, ts, (long)tv.tv_usec / 1000);
+			if (out_jpeg) {
+				*out_jpeg = malloc(len);
+				if (*out_jpeg) {
+					memcpy(*out_jpeg, data, len);
+					*out_len = len;
+					ret = 0;
+				}
+			} else {
+				char path[600];
+				snprintf(path, sizeof path, "%s/latest.jpg", S.dir);
 				ret = write_file(path, data, len);
+				if (!ret && S.keep_all) {
+					struct timeval tv;
+					gettimeofday(&tv, NULL);
+					struct tm tm;
+					localtime_r(&tv.tv_sec, &tm);
+					char ts[64];
+					strftime(ts, sizeof ts, "%Y%m%d-%H%M%S", &tm);
+					snprintf(path, sizeof path, "%s/snap-%s.%03ld.jpg", S.dir, ts, (long)tv.tv_usec / 1000);
+					ret = write_file(path, data, len);
+				}
 			}
 			if (out != pkt)
 				mpp_packet_deinit(&out);
@@ -188,7 +199,9 @@ static void *worker(void *)
 		pthread_mutex_unlock(&S.lock);
 
 		double t0 = now_ms();
-		int r = encode(fd, size);
+		pthread_mutex_lock(&S.enc);
+		int r = encode(fd, size, NULL, NULL);
+		pthread_mutex_unlock(&S.enc);
 		double dt = now_ms() - t0;
 		if (S.done)
 			S.done(idx, S.done_arg); /* buffer goes back to the capture queue */
@@ -213,13 +226,14 @@ extern "C" int snap_init(int in_w, int in_h, int in_stride, int out_w, int quali
 	S.in_stride = in_stride;
 	S.out_w = out_w > 0 && out_w < in_w ? ALIGN(out_w, 2) : 0;
 	S.out_h = S.out_w ? ALIGN(in_h * S.out_w / in_w, 2) : 0;
-	snprintf(S.dir, sizeof S.dir, "%s", dir);
+	snprintf(S.dir, sizeof S.dir, "%s", dir ? dir : "");
 	S.keep_all = keep_all;
 	S.done = done;
 	S.done_arg = arg;
 	S.pending_fd = -1;
 	S.scaled_fd = -1;
 	pthread_mutex_init(&S.lock, NULL);
+	pthread_mutex_init(&S.enc, NULL);
 	pthread_cond_init(&S.cond, NULL);
 
 	if (S.out_w) {
@@ -259,9 +273,24 @@ extern "C" int snap_init(int in_w, int in_h, int in_stride, int out_w, int quali
 
 	if (pthread_create(&S.thread, NULL, worker, NULL))
 		return -1;
-	fprintf(stderr, "snapshots: %dx%d JPEG q%d -> %s/latest.jpg%s\n", w, h, quality, S.dir,
-		keep_all ? " (+ timestamped copies)" : "");
+	if (S.dir[0])
+		fprintf(stderr, "snapshots: %dx%d JPEG q%d -> %s/latest.jpg%s\n", w, h, quality, S.dir,
+			keep_all ? " (+ timestamped copies)" : "");
+	else
+		fprintf(stderr, "snapshots: %dx%d JPEG q%d on request\n", w, h, quality);
 	return 0;
+}
+
+/* Encode a fully captured buffer now, on the calling thread. The JPEG comes back in a malloc'd block
+ * (free() it). 0 = ok. Waits for an encode the worker has in flight. */
+extern "C" int snap_grab(int dmafd, size_t size, void **jpeg, size_t *len)
+{
+	if (!S.ctx)
+		return -1;
+	pthread_mutex_lock(&S.enc);
+	int r = encode(dmafd, size, jpeg, len);
+	pthread_mutex_unlock(&S.enc);
+	return r;
 }
 
 /* Hand over a fully captured buffer. Returns 1 if taken (done() will be
