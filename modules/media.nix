@@ -8,7 +8,8 @@ let
   rga-bench = pkgs.callPackage ../pkgs/rga-bench.nix { inherit librga; };
   gst-rockchip = pkgs.callPackage ../pkgs/gst-rockchip.nix { inherit rockchip-mpp librga; };
   hdmirx-record = pkgs.callPackage ../pkgs/hdmirx-record.nix { inherit gst-rockchip; };
-  hdmi-passthru = pkgs.callPackage ../pkgs/hdmi-passthru.nix { };
+  hdmi-passthru = pkgs.callPackage ../pkgs/hdmi-passthru.nix { inherit rockchip-mpp librga; };
+  hdmirx-audio-stream = pkgs.callPackage ../pkgs/hdmirx-audio-stream.nix { };
 in
 {
   # The encoder, RGA and DMA heaps are root-only (0600) by default.
@@ -34,6 +35,7 @@ in
     gst-rockchip
     hdmirx-record
     hdmi-passthru # HDMI-in -> HDMI-out with a text overlay, ~1 ms
+    hdmirx-audio-stream # HDMI-in audio -> Opus over RTP/SRT
     librga
     rga-bench # RGA scale/convert throughput
     pkgs.gst_all_1.gstreamer

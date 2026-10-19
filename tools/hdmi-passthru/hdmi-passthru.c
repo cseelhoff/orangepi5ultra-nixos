@@ -20,7 +20,16 @@
 //   -R  only repair a display left in a bad state (refresh range, plane order)
 //   -S  serve the Natively edge daemon on this Unix socket (see novl.h): it draws the overlay,
 //       which then covers the whole output instead of the stats box, and asks for screenshots.
-//       The socket is mode 0660, group -G. At least 6 capture buffers are used.
+//       The socket is mode 0660, group -G. At least 6 capture buffers are used (8 with -o).
+//
+// Snapshots (hardware JPEG, on a worker thread; the display path never waits):
+//   -o dir   write dir/latest.jpg (atomically replaced)
+//   -I sec   interval (default 1; 0 = only when sent SIGUSR1: kill -USR1 <pid>)
+//   -W px    scale to this width with RGA first (e.g. 1920); default native
+//   -Q q     JPEG quality 1-99 (default 80)
+//   -A       also keep timestamped copies dir/snap-<time>.jpg
+// Snapshots show the input frame (no overlay). Tested: 4K 367 KB in ~34 ms,
+// 1080p 141 KB in ~13 ms, passthrough latency unchanged (~0.9 ms).
 #define _GNU_SOURCE
 #include <cairo.h>
 #include <errno.h>
@@ -36,6 +45,7 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
+#include "snapshot.h"
 #include <linux/videodev2.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -176,14 +186,39 @@ static void draw_text(struct dumb *d, const char *line1, const char *line2)
 /* ---------- state ---------- */
 struct cap { int dmafd; uint32_t fb; uint64_t ts; int fence; };
 static struct cap bufs[MAXBUF];
-static int vfd, dfd, nbuf = 4;
+static int vfd, dfd, nbuf = 0; /* 0: default (4, or 5 with snapshots) */
+static size_t bufsize;
+static struct novl *novl;	/* the edge daemon's server, with -S */
+
+/* snapshots: requested by the interval timer or SIGUSR1, taken from the
+ * buffer that just left the screen (always fully captured) */
+static const char *snap_dir;
+static double snap_interval = 1.0;
+static int snap_width, snap_quality = 80, snap_keep_all;
+static volatile sig_atomic_t snap_req;
+static void on_usr1(int s) { (void)s; snap_req = 1; }
+static void qbuf(int i);
+static void snap_done(int index, void *arg) { (void)arg; qbuf(index); }
+
+/* Give a no-longer-displayed buffer back to capture. It has been scanned out for a whole frame, so
+ * it is complete: first offer it to whoever waits for such a buffer, an edge-daemon screenshot
+ * (which requeues it itself) or a JPEG snapshot. */
+static void release_buffer(int i)
+{
+	if (novl && novl_hold(novl, i))
+		return;
+	if (snap_dir && snap_req && snap_submit(i, bufs[i].dmafd, bufsize)) {
+		snap_req = 0;
+		return;
+	}
+	qbuf(i);
+}
 static int on_screen = -1, pending = -1, latest = -1;
 static uint64_t pending_commit_ns;
 static uint32_t crtc_id, vplane, oplane;
 static uint32_t ov_fb_prop;	/* the overlay plane's FB_ID, looked up once so an overlay swap adds no ioctls to a commit */
 static struct dumb ov[2];
 static int ov_cur, ov_dirty;
-static struct novl *novl;	/* the edge daemon's server, with -S */
 static int wait_fence;
 
 /* phase lock: nudge the output frame length (VOP2 "variable refresh rate",
@@ -281,10 +316,8 @@ static void flip_done(int fd, unsigned int seq, unsigned int sec, unsigned int u
 	}
 	if (novl)
 		novl_flip_done(novl);
-	/* The buffer that was on screen has been scanned out for a whole frame, so it is complete.
-	 * A snapshot may be waiting for exactly such a buffer; it requeues it when done. */
-	if (on_screen >= 0 && on_screen != i && !(novl && novl_hold(novl, on_screen)))
-		qbuf(on_screen);
+	if (on_screen >= 0 && on_screen != i)
+		release_buffer(on_screen);
 	on_screen = i;
 	pending = -1;
 	/* A frame captured just before this vblank would now go out a whole
@@ -417,8 +450,13 @@ int main(int argc, char **argv)
 	const char *text = "HDMI passthrough - Orange Pi 5 Ultra";
 	const char *logpath = NULL, *sockpath = NULL, *sockgroup = NULL;
 	int seconds = 0, quiet = 0, opt;
-	while ((opt = getopt(argc, argv, "t:s:n:fql:p:RLS:G:")) != -1) {
+	while ((opt = getopt(argc, argv, "t:s:n:fql:p:RLo:I:W:Q:AS:G:")) != -1) {
 		switch (opt) {
+		case 'o': snap_dir = optarg; break;
+		case 'I': snap_interval = atof(optarg); break;
+		case 'W': snap_width = atoi(optarg); break;
+		case 'Q': snap_quality = atoi(optarg); break;
+		case 'A': snap_keep_all = 1; break;
 		case 'R': reset_only = 1; break;
 		case 'p': target_ms = atof(optarg); break;
 		case 'L': keep_normal = 1; break;
@@ -430,18 +468,27 @@ int main(int argc, char **argv)
 		case 'l': logpath = optarg; break;
 		case 'S': sockpath = optarg; break;
 		case 'G': sockgroup = optarg; break;
-		default: die("usage: %s [-t text] [-s seconds] [-n buffers 2-%d] [-f] [-q] [-l log.csv] [-p phase_ms] [-L] [-R] [-S socket [-G group]]", argv[0], MAXBUF);
+		default: die("usage: %s [-t text] [-s seconds] [-n buffers 2-%d] [-f] [-q] [-l log.csv] [-p phase_ms] [-L] [-R] [-S socket [-G group]]\n"
+			     "       snapshots: -o dir [-I interval_s (0 = only on SIGUSR1)] [-W width] [-Q jpeg_quality] [-A]",
+			     argv[0], MAXBUF);
 		}
 	}
+	if (!nbuf)
+		nbuf = snap_dir ? 6 : 4; /* a 4K JPEG holds its buffer ~2 frames */
 	if (nbuf < 2 || nbuf > MAXBUF)
 		die("buffers must be 2..%d", MAXBUF);
-	/* a snapshot keeps one capture buffer out of the queue while it copies the crop */
-	if (sockpath && nbuf < 6)
-		nbuf = 6;
+	/* an edge-daemon screenshot keeps one capture buffer out of the queue while it copies the crop;
+	 * with a JPEG snapshot (-o) in flight too, two are out on top of on-screen/pending/latest */
+	if (sockpath && nbuf < (snap_dir ? 8 : 6))
+		nbuf = snap_dir ? 8 : 6;
 	if (logpath && !(logf = fopen(logpath, "w")))
 		die("open %s: %s", logpath, strerror(errno));
 	signal(SIGINT, on_sig);
 	signal(SIGTERM, on_sig);
+	if (snap_dir) {
+		struct sigaction sa = { .sa_handler = on_usr1, .sa_flags = SA_RESTART };
+		sigaction(SIGUSR1, &sa, NULL);
+	}
 
 	/* ---- capture ---- */
 	if (!keep_normal && !reset_only)
@@ -580,6 +627,14 @@ int main(int argc, char **argv)
 		uint32_t handles[4] = { h, h }, pitches[4] = { stride, stride * cpp_uv }, offsets[4] = { 0, stride * H };
 		if (drmModeAddFB2(dfd, W, H, drmfmt, handles, pitches, offsets, &bufs[i].fb, 0))
 			die("addfb capture: %s", strerror(errno));
+	}
+
+	bufsize = (size_t)stride * H * (drmfmt == DRM_FORMAT_NV12 ? 3 : drmfmt == DRM_FORMAT_NV16 ? 4 : 6) / 2;
+	if (snap_dir) {
+		if (drmfmt != DRM_FORMAT_NV12)
+			die("snapshots need NV12 capture");
+		if (snap_init(W, H, stride, snap_width, snap_quality, snap_dir, snap_keep_all, snap_done, NULL))
+			die("snapshot encoder setup failed");
 	}
 
 	/* overlay: two buffers so updates never tear. With -S the daemon draws it, so it covers the
@@ -732,13 +787,25 @@ int main(int argc, char **argv)
 			}
 		}
 		uint64_t t = now_ns();
+		static uint64_t next_snap;
+		if (snap_dir && snap_interval > 0 && t >= next_snap) {
+			snap_req = 1;
+			next_snap = t + (uint64_t)(snap_interval * 1e9);
+		}
 		if (t - tsec >= 1000000000ull) {
 			double avg = lat_n ? lat_sum / lat_n : 0;
 			snprintf(line2, sizeof line2, "capture->scanout %.1f ms (min %.1f max %.1f)  %d fps  drop %d",
 				 avg, lat_n ? lat_min : 0, lat_max, lat_n, dropped);
-			if (!quiet)
-				fprintf(stderr, "%s  [commit->vblank %.2f ms, nudged frames %d]\n", line2,
-					lat_n ? cmt_sum / lat_n : 0, nudges);
+			if (!quiet) {
+				char snapinfo[64] = "";
+				if (snap_dir) {
+					unsigned sc; double sms;
+					snap_stats(&sc, &sms);
+					snprintf(snapinfo, sizeof snapinfo, ", snapshots %u (last %.1f ms)", sc, sms);
+				}
+				fprintf(stderr, "%s  [commit->vblank %.2f ms, nudged frames %d%s]\n", line2,
+					lat_n ? cmt_sum / lat_n : 0, nudges, snapinfo);
+			}
 			nudges = 0;
 			if (!novl) {	/* with -S the overlay is the daemon's */
 				int nxt = !ov_cur;
@@ -751,6 +818,8 @@ int main(int argc, char **argv)
 	}
 
 	novl_stop(novl);	/* before STREAMOFF: it requeues buffers */
+	if (snap_dir)
+		snap_close();
 	xioctl(vfd, VIDIOC_STREAMOFF, &type);
 	if (all_n) {
 		qsort(all_lat, all_n, sizeof *all_lat, cmp_d);

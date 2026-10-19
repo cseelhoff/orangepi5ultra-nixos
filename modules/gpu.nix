@@ -4,8 +4,10 @@
 #   EGL / GLES 3.2: system-wide through libglvnd (libEGL_mali adapter), so
 #   unmodified programs use the GPU. glvnd dispatch costs ~0.03 us per GL call,
 #   the same path every Mesa program takes.
-#   GBM: programs that drive the display directly through GBM (no Wayland/X)
-#   need libmali's own libgbm: run them with `libmali-run <program>`.
+#   GBM: a Mesa GBM backend (rockchip_gbm.so) hands buffer allocation to
+#   libmali, so compositors and other direct-to-display programs using the
+#   system libgbm work unmodified (kmscube 60 fps on HDMI-out).
+#   `libmali-run <program>` remains as a fallback that swaps in libmali's libgbm.
 # Tested 2026-10-18: clpeak fp32 492 GFLOPS, fp16 964, int8 dot 1934 GOPS;
 # glmark2-es2-drm --off-screen 1353 through glvnd.
 # Needs nixpkgs.config.allowUnfree (libmali is unfree but redistributable).

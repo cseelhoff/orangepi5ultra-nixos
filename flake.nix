@@ -45,8 +45,19 @@
         gpu = ./modules/gpu.nix;
         # RK3588 NPU through Rockchip's native runtime (librknnrt) + rknn_benchmark.
         npu = ./modules/npu.nix;
+        # Root filesystem + boot for an install on the NVMe (instead of sd-card).
+        nvme-root = ./modules/nvme-root.nix;
+        # Everything except the disk layout.
+        board = {
+          imports = [ self.nixosModules.hardware self.nixosModules.media self.nixosModules.hdmirx-edid self.nixosModules.gpu self.nixosModules.npu ];
+        };
+        # SD card system (the flashed image).
         default = {
-          imports = [ self.nixosModules.hardware self.nixosModules.sd-card self.nixosModules.media self.nixosModules.hdmirx-edid self.nixosModules.gpu self.nixosModules.npu ];
+          imports = [ self.nixosModules.board self.nixosModules.sd-card ];
+        };
+        # NVMe system.
+        nvme = {
+          imports = [ self.nixosModules.board self.nixosModules.nvme-root ];
         };
       };
 
@@ -67,7 +78,8 @@
         gst-rockchip = pkgs.callPackage ./pkgs/gst-rockchip.nix { inherit (self.packages.${system}) rockchip-mpp librga; };
         hdmirx-record = pkgs.callPackage ./pkgs/hdmirx-record.nix { inherit (self.packages.${system}) gst-rockchip; };
         hdmirx-edid-sync = pkgs.callPackage ./pkgs/hdmirx-edid-sync.nix { };
-        hdmi-passthru = pkgs.callPackage ./pkgs/hdmi-passthru.nix { };
+        hdmi-passthru = pkgs.callPackage ./pkgs/hdmi-passthru.nix { inherit (self.packages.${system}) rockchip-mpp librga; };
+        hdmirx-audio-stream = pkgs.callPackage ./pkgs/hdmirx-audio-stream.nix { };
         sdImage = self.nixosConfigurations.opi5ultra.config.system.build.sdImage;
         default = self.packages.${system}.sdImage;
       };
