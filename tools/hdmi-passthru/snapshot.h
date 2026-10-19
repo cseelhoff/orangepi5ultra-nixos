@@ -8,9 +8,10 @@ extern "C" {
 /* Called on the worker thread when buffer `index` may be reused. */
 typedef void (*snap_done_fn)(int index, void *arg);
 
-/* out_w: scale to this width first (0 = native). quality: JPEG 1..99.
+/* rgb: the input is packed B,G,R (in_stride in bytes), converted to NV12 by the RGA; else NV12.
+ * out_w: scale to this width first (0 = native). quality: JPEG 1..99.
  * dir != NULL: writes <dir>/latest.jpg atomically, plus snap-<time>.jpg if keep_all (snap_submit). */
-int snap_init(int in_w, int in_h, int in_stride, int out_w, int quality,
+int snap_init(int in_w, int in_h, int in_stride, int rgb, int out_w, int quality,
 	      const char *dir, int keep_all, snap_done_fn done, void *arg);
 /* 1 = taken (done() follows), 0 = encoder busy, keep the buffer. */
 int snap_submit(int index, int dmafd, size_t size);

@@ -20,7 +20,7 @@
 //   -R  only repair a display left in a bad state (refresh range, plane order)
 //   -S  serve the Natively edge daemon on this Unix socket (see novl.h): it draws the overlay,
 //       which then covers the whole output instead of the stats box, and asks for screenshots
-//       (a hardware JPEG of the whole picture, like -o; needs NV12; -W and -Q apply to both).
+//       (a hardware JPEG of the whole picture, like -o; needs NV12 or RGB; -W and -Q apply to both).
 //       The socket is mode 0660, group -G. At least 6 capture buffers are used (8 with -o).
 //
 // Snapshots (hardware JPEG, on a worker thread; the display path never waits):
@@ -515,6 +515,7 @@ int main(int argc, char **argv)
 	case V4L2_PIX_FMT_NV12: drmfmt = DRM_FORMAT_NV12; break;
 	case V4L2_PIX_FMT_NV16: drmfmt = DRM_FORMAT_NV16; break;
 	case V4L2_PIX_FMT_NV24: drmfmt = DRM_FORMAT_NV24; break;
+	case V4L2_PIX_FMT_BGR24: drmfmt = DRM_FORMAT_RGB888; break;	/* same bytes (B, G, R): scanned out as is */
 	default: die("unsupported capture format %.4s", (char *)&pix);
 	}
 	struct v4l2_dv_timings tim = { 0 };
@@ -633,15 +634,18 @@ int main(int argc, char **argv)
 			die("prime import: %s", strerror(errno));
 		uint32_t cpp_uv = drmfmt == DRM_FORMAT_NV24 ? 2 : 1;
 		uint32_t handles[4] = { h, h }, pitches[4] = { stride, stride * cpp_uv }, offsets[4] = { 0, stride * H };
+		if (drmfmt == DRM_FORMAT_RGB888)
+			handles[1] = pitches[1] = offsets[1] = 0;
 		if (drmModeAddFB2(dfd, W, H, drmfmt, handles, pitches, offsets, &bufs[i].fb, 0))
 			die("addfb capture: %s", strerror(errno));
 	}
 
-	bufsize = (size_t)stride * H * (drmfmt == DRM_FORMAT_NV12 ? 3 : drmfmt == DRM_FORMAT_NV16 ? 4 : 6) / 2;
+	bufsize = drmfmt == DRM_FORMAT_RGB888 ? (size_t)stride * H
+		: (size_t)stride * H * (drmfmt == DRM_FORMAT_NV12 ? 3 : drmfmt == DRM_FORMAT_NV16 ? 4 : 6) / 2;
 	if (snap_dir || sockpath) {	/* -o files and the edge daemon's screenshots share one encoder */
-		if (drmfmt != DRM_FORMAT_NV12)
-			die("snapshots need NV12 capture");
-		if (snap_init(W, H, stride, snap_width, snap_quality, snap_dir, snap_keep_all, snap_done, NULL))
+		if (drmfmt != DRM_FORMAT_NV12 && drmfmt != DRM_FORMAT_RGB888)
+			die("snapshots need NV12 or RGB capture");
+		if (snap_init(W, H, stride, drmfmt == DRM_FORMAT_RGB888, snap_width, snap_quality, snap_dir, snap_keep_all, snap_done, NULL))
 			die("snapshot encoder setup failed");
 	}
 

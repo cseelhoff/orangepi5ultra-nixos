@@ -30,6 +30,7 @@
 static struct {
 	/* config */
 	int in_w, in_h, in_stride;
+	int rgb;	/* input is packed B,G,R, not NV12 */
 	int out_w, out_h;
 	char dir[512];	/* empty: no files, only snap_grab() */
 	int keep_all;
@@ -99,14 +100,19 @@ static int encode(int fd, size_t size, void **out_jpeg, size_t *out_len)
 {
 	int w = S.in_w, h = S.in_h, hstride = S.in_stride, vstride = S.in_h;
 
-	/* optional RGA downscale into our own buffer */
-	if (S.out_w && S.out_w != S.in_w) {
+	/* RGA into our own buffer: downscale and/or RGB -> NV12 */
+	if (S.out_w) {
 		rga_buffer_handle_t sh = importbuffer_fd(fd, size);
 		rga_buffer_handle_t dh = importbuffer_fd(S.scaled_fd, S.scaled_size);
-		rga_buffer_t src = wrapbuffer_handle(sh, S.in_w, S.in_h, RK_FORMAT_YCbCr_420_SP, S.in_stride, S.in_h);
+		rga_buffer_t src = S.rgb ? wrapbuffer_handle(sh, S.in_w, S.in_h, RK_FORMAT_BGR_888, S.in_stride / 3, S.in_h)
+					 : wrapbuffer_handle(sh, S.in_w, S.in_h, RK_FORMAT_YCbCr_420_SP, S.in_stride, S.in_h);
 		rga_buffer_t dst = wrapbuffer_handle(dh, S.out_w, S.out_h, RK_FORMAT_YCbCr_420_SP,
 						     ALIGN(S.out_w, 16), ALIGN(S.out_h, 16));
-		IM_STATUS st = imresize(src, dst);
+		rga_buffer_t pat;
+		memset(&pat, 0, sizeof pat);
+		im_rect none;
+		memset(&none, 0, sizeof none);
+		IM_STATUS st = S.rgb ? improcess(src, dst, pat, none, none, none, IM_SYNC) : imresize(src, dst);
 		releasebuffer_handle(sh);
 		releasebuffer_handle(dh);
 		if (st != IM_STATUS_SUCCESS) {
@@ -217,14 +223,15 @@ static void *worker(void *)
 	return NULL;
 }
 
-extern "C" int snap_init(int in_w, int in_h, int in_stride, int out_w, int quality,
+extern "C" int snap_init(int in_w, int in_h, int in_stride, int rgb, int out_w, int quality,
 			 const char *dir, int keep_all, snap_done_fn done, void *arg)
 {
 	memset(&S, 0, sizeof S);
 	S.in_w = in_w;
 	S.in_h = in_h;
 	S.in_stride = in_stride;
-	S.out_w = out_w > 0 && out_w < in_w ? ALIGN(out_w, 2) : 0;
+	S.rgb = rgb;
+	S.out_w = out_w > 0 && out_w < in_w ? ALIGN(out_w, 2) : (rgb ? ALIGN(in_w, 2) : 0);
 	S.out_h = S.out_w ? ALIGN(in_h * S.out_w / in_w, 2) : 0;
 	snprintf(S.dir, sizeof S.dir, "%s", dir ? dir : "");
 	S.keep_all = keep_all;
