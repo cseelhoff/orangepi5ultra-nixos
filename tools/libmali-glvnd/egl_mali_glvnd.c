@@ -10,6 +10,12 @@
 // libmali-hook (Rockchip's compatibility fixes for eglGetDisplay, GBM, ...)
 // is searched before libmali itself, as the libmali wrapper libraries do.
 //
+// GBM: programs linked against the system (Mesa) libgbm get objects from our
+// GBM backend (mali_gbm_backend.c, installed as rockchip_gbm.so); window
+// surfaces, GBM displays and native-pixmap images are unwrapped to the
+// libmali objects before they reach Mali's EGL. libmali is loaded with
+// RTLD_DEEPBIND so its own gbm_* calls never bind to Mesa's libgbm.
+//
 // Limitation: EGL extension functions are handed to glvnd directly instead of
 // through per-display dispatch stubs. That is correct while libmali owns the
 // displays (the only GPU on the RK3588; 10_mali.json sorts before Mesa's
@@ -30,8 +36,28 @@
 #ifndef LIBMALI_PATH
 #define LIBMALI_PATH "libmali.so.1"
 #endif
+#ifndef MALI_GBM_BACKEND_PATH
+#define MALI_GBM_BACKEND_PATH "rockchip_gbm.so"
+#endif
 
 static void *hook, *mali;
+
+/* Programs linked against the system libgbm get GBM objects from our Mesa
+ * GBM backend (mali_gbm_backend.c); Mali's EGL needs the libmali objects
+ * behind them. Identity when the backend is not loaded (e.g. libmali-run). */
+static void *gbm_unwrap(void *p)
+{
+	static void *(*unwrap)(void *);
+	static int looked;
+	if (!looked) {
+		void *b = dlopen(MALI_GBM_BACKEND_PATH, RTLD_NOW | RTLD_NOLOAD);
+		if (b)
+			unwrap = (void *(*)(void *))dlsym(b, "mali_gbm_unwrap");
+		/* look again later if the backend wasn't loaded yet */
+		looked = unwrap != NULL;
+	}
+	return unwrap && p ? unwrap(p) : p;
+}
 static PFNEGLGETPROCADDRESSPROC mali_get_proc_address;
 static PFNEGLGETDISPLAYPROC mali_get_display;
 static PFNEGLGETPLATFORMDISPLAYPROC mali_get_platform_display;
@@ -46,7 +72,7 @@ static void *sym(const char *name)
 	return p;
 }
 
-static void *get_proc_address(const char *name)
+static void *mali_proc(const char *name)
 {
 	void *p = sym(name);
 	if (!p && mali_get_proc_address)
@@ -54,8 +80,64 @@ static void *get_proc_address(const char *name)
 	return p;
 }
 
+/* EGL entry points that take a native window/pixmap: unwrap GBM objects. */
+static PFNEGLCREATEWINDOWSURFACEPROC real_create_window_surface;
+static PFNEGLCREATEPLATFORMWINDOWSURFACEPROC real_create_platform_window_surface;
+static PFNEGLCREATEPLATFORMWINDOWSURFACEEXTPROC real_create_platform_window_surface_ext;
+static PFNEGLCREATEIMAGEKHRPROC real_create_image_khr;
+static PFNEGLCREATEIMAGEPROC real_create_image;
+
+static EGLSurface create_window_surface(EGLDisplay d, EGLConfig c, EGLNativeWindowType w, const EGLint *a)
+{
+	return real_create_window_surface(d, c, (EGLNativeWindowType)gbm_unwrap((void *)w), a);
+}
+
+static EGLSurface create_platform_window_surface(EGLDisplay d, EGLConfig c, void *w, const EGLAttrib *a)
+{
+	return real_create_platform_window_surface(d, c, gbm_unwrap(w), a);
+}
+
+static EGLSurface create_platform_window_surface_ext(EGLDisplay d, EGLConfig c, void *w, const EGLint *a)
+{
+	return real_create_platform_window_surface_ext(d, c, gbm_unwrap(w), a);
+}
+
+static EGLImageKHR create_image_khr(EGLDisplay d, EGLContext c, EGLenum t, EGLClientBuffer b, const EGLint *a)
+{
+	if (t == EGL_NATIVE_PIXMAP_KHR)
+		b = (EGLClientBuffer)gbm_unwrap((void *)b);
+	return real_create_image_khr(d, c, t, b, a);
+}
+
+static EGLImage create_image(EGLDisplay d, EGLContext c, EGLenum t, EGLClientBuffer b, const EGLAttrib *a)
+{
+	if (t == EGL_NATIVE_PIXMAP_KHR)
+		b = (EGLClientBuffer)gbm_unwrap((void *)b);
+	return real_create_image(d, c, t, b, a);
+}
+
+static void *get_proc_address(const char *name)
+{
+	static const struct { const char *name; void *wrapper; void **real; } wrapped[] = {
+		{ "eglCreateWindowSurface", create_window_surface, (void **)&real_create_window_surface },
+		{ "eglCreatePlatformWindowSurface", create_platform_window_surface, (void **)&real_create_platform_window_surface },
+		{ "eglCreatePlatformWindowSurfaceEXT", create_platform_window_surface_ext, (void **)&real_create_platform_window_surface_ext },
+		{ "eglCreateImageKHR", create_image_khr, (void **)&real_create_image_khr },
+		{ "eglCreateImage", create_image, (void **)&real_create_image },
+	};
+	for (size_t i = 0; i < sizeof(wrapped) / sizeof(wrapped[0]); i++)
+		if (strcmp(name, wrapped[i].name) == 0) {
+			if (!*wrapped[i].real)
+				*wrapped[i].real = mali_proc(name);
+			return *wrapped[i].real ? wrapped[i].wrapper : NULL;
+		}
+	return mali_proc(name);
+}
+
 static EGLDisplay get_platform_display(EGLenum platform, void *native, const EGLAttrib *attribs)
 {
+	if (native && (platform == EGL_PLATFORM_GBM_KHR || platform == EGL_NONE))
+		native = gbm_unwrap(native);
 	if (platform == EGL_NONE)
 		return mali_get_display ? mali_get_display((EGLNativeDisplayType)native) : EGL_NO_DISPLAY;
 	if (!mali_get_platform_display)
@@ -110,7 +192,12 @@ static void set_dispatch_index(const char *name, int index)
  * made it; recognise libmali's own GBM devices. */
 static EGLenum find_native_display_platform(void *native)
 {
-	if (native && mali_gbm_create_device && *(void **)native == mali_gbm_create_device)
+	if (!native)
+		return EGL_NONE;
+	/* our Mesa GBM backend's devices, or libmali's own (first field is
+	 * the gbm_create_device of the libgbm that made it) */
+	if (gbm_unwrap(native) != native ||
+	    (mali_gbm_create_device && *(void **)native == mali_gbm_create_device))
 		return EGL_PLATFORM_GBM_KHR;
 	return EGL_NONE;
 }
@@ -123,12 +210,12 @@ EGLBoolean __egl_Main(uint32_t version, const __EGLapiExports *exports,
 	if (EGL_VENDOR_ABI_GET_MAJOR_VERSION(version) != EGL_VENDOR_ABI_MAJOR_VERSION)
 		return EGL_FALSE;
 
-	mali = dlopen(LIBMALI_PATH, RTLD_NOW | RTLD_LOCAL);
+	mali = dlopen(LIBMALI_PATH, RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
 	if (!mali) {
 		fprintf(stderr, "libEGL_mali: %s\n", dlerror());
 		return EGL_FALSE;
 	}
-	hook = dlopen(LIBMALI_HOOK_PATH, RTLD_NOW | RTLD_LOCAL);
+	hook = dlopen(LIBMALI_HOOK_PATH, RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
 
 	mali_get_proc_address = (PFNEGLGETPROCADDRESSPROC)sym("eglGetProcAddress");
 	mali_get_display = (PFNEGLGETDISPLAYPROC)sym("eglGetDisplay");
