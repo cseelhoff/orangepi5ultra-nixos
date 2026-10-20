@@ -22,7 +22,7 @@
 #include <unistd.h>
 
 #define MAGIC 0x4C564F4Eu /* "NOVL" */
-enum { T_OVERLAY = 1, T_SNAPSHOT, T_SNAPSHOT_REPLY, T_INFO, T_INFO_REPLY };
+enum { T_OVERLAY = 1, T_SNAPSHOT, T_SNAPSHOT_REPLY, T_INFO, T_INFO_REPLY, T_OVERLAY_RECTS };
 enum { ST_OK = 0, ST_NO_SIGNAL = 1, ST_FAILED = 2 };
 
 #define SIGNAL_MS 500		/* no frame for this long: no signal */
@@ -31,6 +31,7 @@ enum { ST_OK = 0, ST_NO_SIGNAL = 1, ST_FAILED = 2 };
 #define IO_TIMEOUT_S 2
 #define MAX_PIXELS (8192 * 4320)
 #define MAX_SIDE 16384
+#define MAX_RECTS 64	/* rectangles in one OVERLAY_RECTS message */
 
 struct rect { int x, y, w, h; };
 
@@ -49,7 +50,8 @@ struct novl {
 	atomic_int snap_want;	/* a snapshot waits for the loop to hand over a capture buffer */
 	atomic_int snap_held;	/* the capture buffer handed over, plus one; 0 for none */
 
-	struct rect dirty[2];	/* what was last drawn into each overlay buffer; server thread only */
+	struct rect dirty[2][MAX_RECTS];	/* what was last drawn into each overlay buffer; server thread only */
+	int ndirty[2];
 };
 
 static uint64_t now_ns(void)
@@ -176,6 +178,78 @@ static void clear_rect(struct novl *n, int b, struct rect r)
 		memset(n->ov.map[b] + (size_t)(r.y + y) * n->ov.pitch + (size_t)r.x * 4, 0, (size_t)r.w * 4);
 }
 
+static void clear_dirty(struct novl *n, int b)
+{
+	for (int i = 0; i < n->ndirty[b]; i++)
+		clear_rect(n, b, n->dirty[b][i]);
+	n->ndirty[b] = 0;
+}
+
+/* The buffer to draw into is the one the loop is not showing. A finished but untaken
+ * overlay is withdrawn first (this one replaces it), so the loop never takes a half-drawn
+ * buffer. While the commit that took the front buffer has not latched, the other buffer
+ * may still be scanned out, so wait for that (a few hundred microseconds of polling at most
+ * per frame: the overlay is allowed to be a frame late, the video is not). -1: the display is
+ * not flipping, so this update is dropped; the next one replaces it. */
+static int acquire_back(struct novl *n)
+{
+	uint64_t deadline = now_ns() + FLIP_WAIT_MS * 1000000ull;
+	for (;;) {
+		unsigned s = atomic_load(&n->ovs);
+		if (ov_ready(s) >= 0) {
+			atomic_compare_exchange_strong(&n->ovs, &s, ov_make(ov_front(s), -1, ov_busy(s)));
+			continue;	/* look again: the loop may have taken it first */
+		}
+		if (!ov_busy(s))
+			return 1 - (int)ov_front(s);
+		if (n->quit || now_ns() >= deadline)
+			return -1;
+		micros(200);
+	}
+}
+
+/* The finished buffer is handed to the display loop. */
+static void publish(struct novl *n, int back)
+{
+	unsigned s = atomic_load(&n->ovs);	/* nothing else moves it now: the state is (front, none, idle) */
+	while (!atomic_compare_exchange_weak(&n->ovs, &s, ov_make(ov_front(s), back, ov_busy(s))))
+		;
+}
+
+/* Reads the pixels of rectangle r from the socket into buffer `back` (what lands inside the output; the rest is read and
+ * dropped. 64-bit: x and y are the client's) and records what was touched. -1: drop the client. */
+static int blit_rect(struct novl *n, int back, struct rect r)
+{
+	int64_t cx0 = r.x < 0 ? 0 : r.x, cy0 = r.y < 0 ? 0 : r.y;
+	int64_t cx1 = (int64_t)r.x + r.w, cy1 = (int64_t)r.y + r.h;
+	if (cx1 > (int64_t)n->ov.width) cx1 = n->ov.width;
+	if (cy1 > (int64_t)n->ov.height) cy1 = n->ov.height;
+	int visible = cx1 > cx0 && cy1 > cy0;
+	uint8_t *row = malloc((size_t)r.w * 4);
+	if (!row)
+		return -1;
+	if (visible && n->ndirty[back] < MAX_RECTS)	/* set before the first write: a half-drawn buffer is cleaned next time */
+		n->dirty[back][n->ndirty[back]++] = (struct rect){ (int)cx0, (int)cy0, (int)(cx1 - cx0), (int)(cy1 - cy0) };
+	for (int y = 0; y < r.h; y++) {
+		if (recv_all(n->cfd, row, (size_t)r.w * 4)) {
+			free(row);
+			return -1;
+		}
+		int64_t dy = (int64_t)r.y + y;
+		if (!visible || dy < cy0 || dy >= cy1)
+			continue;
+		memcpy(n->ov.map[back] + (size_t)dy * n->ov.pitch + (size_t)cx0 * 4,
+		       row + (size_t)(cx0 - r.x) * 4, (size_t)(cx1 - cx0) * 4);
+	}
+	free(row);
+	return 0;
+}
+
+static int rect_ok(struct rect r)
+{
+	return r.w > 0 && r.h > 0 && r.w <= MAX_SIDE && r.h <= MAX_SIDE && (int64_t)r.w * r.h <= MAX_PIXELS;
+}
+
 /* -1: drop the client */
 static int do_overlay(struct novl *n, uint32_t len)
 {
@@ -184,65 +258,51 @@ static int do_overlay(struct novl *n, uint32_t len)
 		return -1;
 	struct rect r = { get32(hdr), get32(hdr + 4), get32(hdr + 8), get32(hdr + 12) };
 	int empty = r.w == 0 && r.h == 0;
-	if (empty ? len != 16
-		  : r.w <= 0 || r.h <= 0 || r.w > MAX_SIDE || r.h > MAX_SIDE || (int64_t)r.w * r.h > MAX_PIXELS ||
-		    (uint64_t)len != 16 + (uint64_t)r.w * r.h * 4)
+	if (empty ? len != 16 : !rect_ok(r) || (uint64_t)len != 16 + (uint64_t)r.w * r.h * 4)
 		return -1;
 
-	/* The buffer to draw into is the one the loop is not showing. A finished but untaken
-	 * overlay is withdrawn first (this one replaces it), so the loop never takes a half-drawn
-	 * buffer. While the commit that took the front buffer has not latched, the other buffer
-	 * may still be scanned out, so wait for that (a few hundred microseconds of polling at most
-	 * per frame: the overlay is allowed to be a frame late, the video is not). */
-	int back = -1;
-	uint64_t deadline = now_ns() + FLIP_WAIT_MS * 1000000ull;
-	for (;;) {
-		unsigned s = atomic_load(&n->ovs);
-		if (ov_ready(s) >= 0) {
-			atomic_compare_exchange_strong(&n->ovs, &s, ov_make(ov_front(s), -1, ov_busy(s)));
-			continue;	/* look again: the loop may have taken it first */
-		}
-		if (!ov_busy(s)) {
-			back = 1 - (int)ov_front(s);
-			break;
-		}
-		if (n->quit || now_ns() >= deadline)
-			break;
-		micros(200);
-	}
+	int back = acquire_back(n);
 	if (back < 0)
-		return discard(n->cfd, len - 16);	/* the display is not flipping; the next update replaces this one */
+		return discard(n->cfd, len - 16);
+	clear_dirty(n, back);
+	if (!empty && blit_rect(n, back, r))
+		return -1;
+	publish(n, back);
+	return 0;
+}
 
-	clear_rect(n, back, n->dirty[back]);
-	n->dirty[back] = (struct rect){ 0 };
-	if (!empty) {
-		/* what lands inside the output; the rest is read and dropped. 64-bit: x and y are the client's. */
-		int64_t cx0 = r.x < 0 ? 0 : r.x, cy0 = r.y < 0 ? 0 : r.y;
-		int64_t cx1 = (int64_t)r.x + r.w, cy1 = (int64_t)r.y + r.h;
-		if (cx1 > (int64_t)n->ov.width) cx1 = n->ov.width;
-		if (cy1 > (int64_t)n->ov.height) cy1 = n->ov.height;
-		int visible = cx1 > cx0 && cy1 > cy0;
-		uint8_t *row = malloc((size_t)r.w * 4);
-		if (!row)
+/* OVERLAY_RECTS: `i32 count`, then per rectangle `i32 x, y, w, h` and its pixels. The picture to draw is those rectangles on a
+ * clear overlay, which is how a sparse overlay (a corner badge and a panel far away from it, or a crosshair) stays cheap at 4K.
+ * -1: drop the client. */
+static int do_overlay_rects(struct novl *n, uint32_t len)
+{
+	uint8_t cnt[4];
+	if (len < 4 || recv_all(n->cfd, cnt, sizeof cnt))
+		return -1;
+	int32_t count = get32(cnt);
+	if (count < 0 || count > MAX_RECTS)
+		return -1;
+	uint64_t left = len - 4;	/* payload bytes still to come */
+
+	int back = acquire_back(n);
+	if (back < 0)
+		return discard(n->cfd, left);
+	clear_dirty(n, back);
+	for (int i = 0; i < count; i++) {
+		uint8_t hdr[16];
+		if (left < 16 || recv_all(n->cfd, hdr, sizeof hdr))
 			return -1;
-		if (visible)
-			n->dirty[back] = (struct rect){ (int)cx0, (int)cy0, (int)(cx1 - cx0), (int)(cy1 - cy0) };	/* set before the first write: a half-drawn buffer is cleaned next time */
-		for (int y = 0; y < r.h; y++) {
-			if (recv_all(n->cfd, row, (size_t)r.w * 4)) {
-				free(row);
-				return -1;
-			}
-			int64_t dy = (int64_t)r.y + y;
-			if (!visible || dy < cy0 || dy >= cy1)
-				continue;
-			memcpy(n->ov.map[back] + (size_t)dy * n->ov.pitch + (size_t)cx0 * 4,
-			       row + (size_t)(cx0 - r.x) * 4, (size_t)(cx1 - cx0) * 4);
-		}
-		free(row);
+		left -= 16;
+		struct rect r = { get32(hdr), get32(hdr + 4), get32(hdr + 8), get32(hdr + 12) };
+		if (!rect_ok(r) || left < (uint64_t)r.w * r.h * 4)
+			return -1;
+		left -= (uint64_t)r.w * r.h * 4;
+		if (blit_rect(n, back, r))
+			return -1;
 	}
-	unsigned s = atomic_load(&n->ovs);	/* nothing else moves it now: the state is (front, none, idle) */
-	while (!atomic_compare_exchange_weak(&n->ovs, &s, ov_make(ov_front(s), back, ov_busy(s))))
-		;
+	if (left)
+		return -1;	/* more bytes than its rectangles account for */
+	publish(n, back);
 	return 0;
 }
 
@@ -322,6 +382,7 @@ static int serve_one(struct novl *n)
 	uint32_t len = (uint32_t)get32(h + 8);
 	switch (get32(h + 4)) {
 	case T_OVERLAY: return do_overlay(n, len);
+	case T_OVERLAY_RECTS: return do_overlay_rects(n, len);
 	case T_SNAPSHOT: return do_snapshot(n, len);
 	case T_INFO: return do_info(n, len);
 	default: return -1;

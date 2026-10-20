@@ -36,6 +36,7 @@ static struct {
 	pthread_t th;
 	atomic_int run, paused, flip_ms, frame_ms;
 	atomic_int shown, last_shown, bad;
+	atomic_int multi;	/* a test sends several rectangles: the overlay is not one filled box, and the test compares the whole buffer itself */
 	atomic_int holds, last_hold, frames;
 	atomic_int state[NBUF];	/* 0 queued, 1 on screen, 2 held by a snapshot */
 	atomic_long max_hook_us;
@@ -114,7 +115,7 @@ static void *display_loop(void *arg)
 		if (o >= 0) {
 			int x, y, w, h;
 			uint32_t c;
-			if (!overlay_box(L.ov[o], &x, &y, &w, &h, &c))
+			if (!L.multi && !overlay_box(L.ov[o], &x, &y, &w, &h, &c))
 				L.bad++;	/* a buffer taken must be one whole overlay, never a half-drawn one */
 			scanned = 1 - o;	/* until this flip latches, the display is still reading the other buffer */
 			memcpy(scanned_before, L.ov[scanned], sizeof scanned_before);
@@ -191,6 +192,7 @@ static struct novl_source src;
 
 static void setup(void)
 {
+	L.multi = 0;
 	memset(&src, 0, sizeof src);
 	src.width = SW; src.height = SH; src.encode = fake_encode; src.requeue = requeue;
 	E.calls = E.fail = E.delay_ms = E.encoding = E.last_index = E.state_at_encode = 0;
@@ -581,6 +583,176 @@ static void test_clients(void)
 	teardown();
 }
 
+/* ---------- OVERLAY_RECTS ---------- */
+
+struct rc { int x, y, w, h; uint32_t color; };
+
+/* A message of several rectangles (type 6). count and extra let a test lie about it. */
+static int send_rects_ex(int fd, const struct rc *r, int n, int32_t count, int extra)
+{
+	size_t total = 4 + (size_t)extra;
+	for (int i = 0; i < n; i++)
+		total += 16 + (size_t)r[i].w * r[i].h * 4;
+	uint8_t *p = calloc(1, total), *q = p;
+	put32(q, count); q += 4;
+	for (int i = 0; i < n; i++) {
+		put32(q, r[i].x); put32(q + 4, r[i].y); put32(q + 8, r[i].w); put32(q + 12, r[i].h); q += 16;
+		for (size_t k = 0; k < (size_t)r[i].w * r[i].h; k++, q += 4)
+			memcpy(q, &r[i].color, 4);
+	}
+	int rc = send_msg(fd, 6, p, (uint32_t)total);
+	free(p);
+	return rc;
+}
+
+static int send_rects(int fd, const struct rc *r, int n) { return send_rects_ex(fd, r, n, n, 0); }
+
+static int show_rects(int fd, const struct rc *r, int n)
+{
+	int before = L.shown;
+	return send_rects(fd, r, n) == 0 && wait_shown(before + 1);
+}
+
+/* The shown overlay is exactly these rectangles (clipped to the output) and nothing else. */
+static int shown_rects_are(const struct rc *r, int n)
+{
+	const uint8_t *buf = L.ov[L.last_shown];
+	for (int y = 0; y < OH; y++)
+		for (int x = 0; x < OW; x++) {
+			uint32_t want = 0;
+			for (int i = 0; i < n; i++)
+				if (x >= r[i].x && x < r[i].x + r[i].w && y >= r[i].y && y < r[i].y + r[i].h)
+					want = r[i].color;
+			uint32_t got;
+			memcpy(&got, buf + (size_t)y * OPITCH + x * 4, 4);
+			if (got != want)
+				return 0;
+		}
+	return 1;
+}
+
+static void test_overlay_rects(void)
+{
+	setup();
+	L.multi = 1;
+	int fd = cli_connect(), v[5];
+	CHECK(fd >= 0);
+	/* a badge in one corner and a panel far from it: two rectangles, and nothing in between */
+	struct rc a[] = { { 100, 2, 20, 10, 0xFF112233u }, { 5, 70, 60, 20, 0xFF445566u } };
+	CHECK(show_rects(fd, a, 2));
+	CHECK(shown_rects_are(a, 2));
+	/* the next message replaces all of it, in the other buffer, and the old rectangles are cleaned out */
+	struct rc b[] = { { 10, 10, 30, 30, 0xFF778899u } };
+	CHECK(show_rects(fd, b, 1));
+	CHECK(shown_rects_are(b, 1));
+	struct rc c[] = { { 100, 2, 20, 10, 0xFFAAAAAAu }, { 0, 0, 4, 4, 0xFFBBBBBBu }, { 50, 40, 8, 8, 0xFFCCCCCCu } };
+	CHECK(show_rects(fd, c, 3));
+	CHECK(shown_rects_are(c, 3));
+	CHECK(show_rects(fd, b, 1));
+	CHECK(shown_rects_are(b, 1));
+	/* none at all clears everything */
+	CHECK(show_rects(fd, NULL, 0));
+	CHECK(shown_rects_are(NULL, 0));
+	/* partly outside the output is clipped, wholly outside is nothing */
+	struct rc d[] = { { -5, -5, 12, 12, 0xFF010101u }, { OW - 3, OH - 3, 10, 10, 0xFF020202u }, { OW + 20, 0, 4, 4, 0xFF030303u } };
+	CHECK(show_rects(fd, d, 3));
+	CHECK(shown_rects_are(d, 3));
+	/* the old single-rectangle message still works and mixes freely with the new one */
+	CHECK(show(fd, 7, 8, 9, 10, 0xFF0F0F0Fu));
+	CHECK(shown_is(7, 8, 9, 10, 0xFF0F0F0Fu));
+	CHECK(show_rects(fd, a, 2));
+	CHECK(shown_rects_are(a, 2));
+	/* a full rectangle for every one the limit allows */
+	struct rc many[64];
+	for (int i = 0; i < 64; i++)
+		many[i] = (struct rc){ (i % 8) * 16, (i / 8) * 10, 8, 5, 0xFF000000u | (uint32_t)(i + 1) };
+	CHECK(show_rects(fd, many, 64));
+	CHECK(shown_rects_are(many, 64));
+	CHECK(show_rects(fd, b, 1));
+	CHECK(shown_rects_are(b, 1));	/* all 64 cleaned again */
+	CHECK(info(fd, v) == 0);
+	CHECK(L.bad == 0);
+	close(fd);
+	teardown();
+}
+
+static void test_overlay_rects_rejects(void)
+{
+	int v[5];
+	struct rc one[] = { { 1, 1, 4, 4, 0xFF010203u } };
+	struct rc two[] = { { 1, 1, 4, 4, 0xFF010203u }, { 9, 9, 3, 3, 0xFF040506u } };
+
+	setup();
+	L.multi = 1;
+	int fd = cli_connect();
+	CHECK(fd >= 0 && send_rects_ex(fd, one, 1, 65, 0) == 0);	/* more rectangles than the limit */
+	CHECK(info(fd, v) != 0);
+	close(fd);
+
+	fd = cli_connect();
+	CHECK(fd >= 0 && send_rects_ex(fd, one, 1, -1, 0) == 0);	/* a negative count */
+	CHECK(info(fd, v) != 0);
+	close(fd);
+
+	fd = cli_connect();
+	CHECK(fd >= 0 && send_rects_ex(fd, two, 2, 1, 0) == 0);	/* more bytes than the count accounts for */
+	CHECK(info(fd, v) != 0);
+	close(fd);
+
+	fd = cli_connect();
+	CHECK(fd >= 0 && send_rects_ex(fd, one, 1, 1, 12) == 0);	/* trailing junk */
+	CHECK(info(fd, v) != 0);
+	close(fd);
+
+	fd = cli_connect();
+	uint8_t shortmsg[8];
+	put32(shortmsg, 2); put32(shortmsg + 4, 0);
+	CHECK(fd >= 0 && send_msg(fd, 6, shortmsg, 8) == 0);	/* promises two rectangles, carries none */
+	CHECK(info(fd, v) != 0);
+	close(fd);
+
+	fd = cli_connect();
+	uint8_t absurd[20];
+	put32(absurd, 1); put32(absurd + 4, 0); put32(absurd + 8, 0); put32(absurd + 12, 100000); put32(absurd + 16, 100000);
+	CHECK(fd >= 0 && send_msg(fd, 6, absurd, 20) == 0);	/* an absurd rectangle */
+	CHECK(info(fd, v) != 0);
+	close(fd);
+
+	fd = cli_connect();
+	put32(absurd + 12, 0); put32(absurd + 16, 5);
+	CHECK(fd >= 0 && send_msg(fd, 6, absurd, 20) == 0);	/* an empty rectangle inside a list */
+	CHECK(info(fd, v) != 0);
+	close(fd);
+
+	fd = cli_connect();
+	CHECK(fd >= 0 && info(fd, v) == 0);	/* and the server is none the worse */
+	CHECK(L.bad == 0);
+	close(fd);
+	teardown();
+}
+
+static void test_overlay_rects_while_the_flip_stalls(void)
+{
+	setup();
+	L.multi = 1;
+	int fd = cli_connect();
+	struct rc a[] = { { 0, 0, 10, 10, 0xFF0000FFu } };
+	struct rc b[] = { { 0, 0, 20, 20, 0xFF00FF00u } };
+	struct rc dropped[] = { { 5, 5, 6, 6, 0xFFFF0000u }, { 40, 40, 6, 6, 0xFFFF0000u } };
+	CHECK(show_rects(fd, a, 1));
+	L.flip_ms = 450;
+	CHECK(show_rects(fd, b, 1));
+	CHECK(send_rects(fd, dropped, 2) == 0);	/* nowhere to go for 200 ms: dropped, and its bytes are skipped in step */
+	usleep(600000);
+	L.flip_ms = 0;
+	struct rc after[] = { { 7, 8, 9, 10, 0xFF0F0F0Fu } };
+	CHECK(show_rects(fd, after, 1));
+	CHECK(shown_rects_are(after, 1));
+	CHECK(L.bad == 0);
+	close(fd);
+	teardown();
+}
+
 int main(int argc, char **argv)
 {
 	if (argc == 4 && !strcmp(argv[1], "--serve")) {	/* the server and a fake 60 Hz display loop, for novl_load */
@@ -599,6 +771,9 @@ int main(int argc, char **argv)
 	test_big_overlay_does_not_stall_the_loop();
 	test_snapshot();
 	test_clients();
+	test_overlay_rects();
+	test_overlay_rects_rejects();
+	test_overlay_rects_while_the_flip_stalls();
 	printf("novl: %d checks, %d failed\n", checks, failures);
 	return failures != 0;
 }
