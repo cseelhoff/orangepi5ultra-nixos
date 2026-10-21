@@ -71,7 +71,16 @@
     "nvme_core.default_ps_max_latency_us=0"
     "pcie_aspm=off"
     "pcie_port_pm=off"
+    # Diagnostic (2026-10-20): the DRAM-less SSD (RTS5765DL) lends the host a
+    # 64 MiB Host Memory Buffer; 0 turns that off. Test one change at a time.
+    "nvme.max_host_mem_size_mb=0"
   ];
+
+  # Diagnostic: the board freezes (async SError, regulator I2C timeouts) and no
+  # trace has ever been saved. Reboot 10 s after a panic so pstore/ramoops can
+  # keep it, and fsync the journal every second so the last lines survive.
+  boot.kernel.sysctl."kernel.panic" = 10;
+  services.journald.extraConfig = "SyncIntervalSec=1s";
 
   # The AP6611S's bcmdhd driver scans unreliably with MAC address
   # randomization and power saving on: `nmcli device wifi list` can come back
